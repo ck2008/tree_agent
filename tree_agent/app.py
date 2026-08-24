@@ -54,30 +54,53 @@ LIGHT_COLORS = {
     "drop_target": "#e6f0ff",
     "log": "#9aa1ab",
     "tooltip": "#333a44",
+    "activity": "#eef0f3",
+    "sidebar": "#ffffff",
+    "editor": "#ffffff",
+    "toolbar": "#f6f7f9",
+    "input": "#ffffff",
+    "hover": "#e8f0fe",
+    "button": "#ffffff",
+    "button_hover": "#e8f0fe",
+    "primary": "#1a56db",
+    "primary_hover": "#1649ba",
+    "focus": "#1a56db",
 }
 
 DARK_COLORS = {
-    "bg": "#1b1f27",
-    "panel": "#252b36",
-    "border": "#3a4352",
-    "text": "#e6edf3",
-    "muted": "#a8b3c3",
-    "user": "#8ab4ff",
-    "agent": "#e6edf3",
-    "reasoning": "#b5becd",
-    "tool": "#ced8e6",
-    "tool_bg": "#202631",
-    "error": "#ff8c8c",
-    "notice": "#ffd580",
-    "accent": "#8ab4ff",
-    "user_bg": "#263b5b",
-    "warn_bg": "#423820",
-    "select": "#35557f",
-    "select_idle": "#2b3d56",
-    "tree_conversation": "#c1cede",
-    "drop_target": "#304e75",
-    "log": "#a6b0bd",
+    # VS Code Dark+ surface and semantic colours.
+    "bg": "#1e1e1e",
+    "panel": "#1e1e1e",
+    "border": "#3c3c3c",
+    "text": "#d4d4d4",
+    "muted": "#9d9d9d",
+    "user": "#4daafc",
+    "agent": "#d4d4d4",
+    "reasoning": "#9d9d9d",
+    "tool": "#cccccc",
+    "tool_bg": "#252526",
+    "error": "#f14c4c",
+    "notice": "#cca700",
+    "accent": "#3794ff",
+    "user_bg": "#2a2d2e",
+    "warn_bg": "#332f16",
+    "select": "#094771",
+    "select_idle": "#37373d",
+    "tree_conversation": "#cccccc",
+    "drop_target": "#007fd4",
+    "log": "#9d9d9d",
     "tooltip": "#111827",
+    "activity": "#181818",
+    "sidebar": "#252526",
+    "editor": "#1e1e1e",
+    "toolbar": "#181818",
+    "input": "#3c3c3c",
+    "hover": "#2a2d2e",
+    "button": "#3c3c3c",
+    "button_hover": "#505050",
+    "primary": "#0e639c",
+    "primary_hover": "#1177bb",
+    "focus": "#007fd4",
 }
 
 # Kept mutable because richtext receives this palette by reference.  Updating
@@ -198,11 +221,9 @@ class TreeAgentApp:
         self._turn_counter = 0
         self.events: queue.Queue[tuple[str, int, dict[str, Any]]] = queue.Queue()
         self.current_id: str | None = None
-        self.tool_display = (self.ws.data.get("ui") or {}).get(
-            "tool_display", TOOL_COLLAPSED
-        )
-        if self.tool_display not in dict(TOOL_DISPLAY_LABELS):
-            self.tool_display = TOOL_COLLAPSED
+        # Tool calls are audit data, not part of the answer.  Keep them in
+        # the information rail and never render them in the central transcript.
+        self.tool_display = TOOL_HIDDEN
         ui_state = self.ws.data.get("ui") or {}
         self.theme = ui_state.get("theme", THEME_LIGHT)
         if self.theme not in (THEME_LIGHT, THEME_DARK):
@@ -262,6 +283,7 @@ class TreeAgentApp:
         style.configure(".", font=(self.ui_font, 10))
         style.configure("TFrame", background=COLORS["bg"])
         style.configure("Panel.TFrame", background=COLORS["panel"])
+        style.configure("Sidebar.TFrame", background=COLORS["sidebar"])
         style.configure("TLabel", background=COLORS["bg"], foreground=COLORS["text"])
         style.configure("Panel.TLabel", background=COLORS["panel"], foreground=COLORS["text"])
         style.configure(
@@ -273,20 +295,45 @@ class TreeAgentApp:
         style.configure(
             "Section.TLabel", background=COLORS["bg"], foreground=COLORS["text"], font=(self.ui_font, 11, "bold")
         )
-        style.configure("Treeview", rowheight=26, font=(self.ui_font, 10), background=COLORS["panel"],
-                        fieldbackground=COLORS["panel"], foreground=COLORS["text"], bordercolor=COLORS["border"],
+        style.configure("Treeview", rowheight=24 if self.theme == THEME_DARK else 26, font=(self.ui_font, 10), background=COLORS["sidebar"],
+                        fieldbackground=COLORS["sidebar"], foreground=COLORS["text"], bordercolor=COLORS["border"],
                         lightcolor=COLORS["border"], darkcolor=COLORS["border"])
-        style.map("Treeview", background=[("selected", COLORS["select"])], foreground=[("selected", COLORS["text"])])
-        style.configure("TButton", background=COLORS["panel"], foreground=COLORS["text"], bordercolor=COLORS["border"])
-        style.map("TButton", background=[("active", COLORS["select"])], foreground=[("disabled", COLORS["muted"])])
-        style.configure("TEntry", fieldbackground=COLORS["panel"], foreground=COLORS["text"], bordercolor=COLORS["border"])
-        style.configure("TCombobox", fieldbackground=COLORS["panel"], foreground=COLORS["text"], background=COLORS["panel"], bordercolor=COLORS["border"])
-        style.map("TCombobox", fieldbackground=[("readonly", COLORS["panel"])], foreground=[("readonly", COLORS["text"])])
+        style.map("Treeview", background=[("selected", COLORS["select"]), ("active", COLORS["hover"])], foreground=[("selected", "#ffffff")])
+        style.configure("TButton", background=COLORS["button"], foreground=COLORS["text"], bordercolor=COLORS["border"], relief="flat")
+        style.map("TButton", background=[("active", COLORS["button_hover"])], foreground=[("disabled", COLORS["muted"])])
+        # Vista ignores a custom ttk button background in light mode.  Its
+        # default face stays white, so a white primary label disappears.  Use
+        # a dark label there; the colourable Dark+ (clam) button keeps white.
+        primary_foreground = "#ffffff" if self.theme == THEME_DARK else COLORS["text"]
+        style.configure(
+            "Primary.TButton", background=COLORS["primary"], foreground=primary_foreground,
+            bordercolor=COLORS["primary"], padding=(8, 4),
+        )
+        # The Windows Vista renderer can make a disabled primary button's
+        # label white on a white surface.  Use an explicit neutral fill and
+        # readable foreground so an empty composer still shows 「送出 Enter」.
+        style.map(
+            "Primary.TButton",
+            background=[("disabled", COLORS["tool_bg"]), ("active", COLORS["primary_hover"])],
+            foreground=[("disabled", COLORS["text"])],
+            bordercolor=[("disabled", COLORS["border"])],
+        )
+        style.configure("TEntry", fieldbackground=COLORS["input"], foreground=COLORS["text"], bordercolor=COLORS["border"])
+        style.configure("TCombobox", fieldbackground=COLORS["input"], foreground=COLORS["text"], background=COLORS["input"], bordercolor=COLORS["border"])
+        style.map("TCombobox", fieldbackground=[("readonly", COLORS["input"])], foreground=[("readonly", COLORS["text"])])
         style.configure("TCheckbutton", background=COLORS["bg"], foreground=COLORS["text"])
         style.configure("TRadiobutton", background=COLORS["bg"], foreground=COLORS["text"])
         style.configure("TPanedwindow", background=COLORS["border"])
-        style.configure("TScrollbar", background=COLORS["panel"], troughcolor=COLORS["bg"], bordercolor=COLORS["border"], arrowcolor=COLORS["muted"])
-        style.configure("Toolbar.TButton", padding=(6, 3))
+        # Keep every vertical scrollbar on the same palette.  Giving this a
+        # named style avoids the Explorer tree falling back to Windows' light
+        # scrollbar while the transcript is rendered with the clam theme.
+        style.configure(
+            "VS.Vertical.TScrollbar", background=COLORS["button"],
+            troughcolor=COLORS["editor"], bordercolor=COLORS["editor"],
+            arrowcolor=COLORS["muted"], width=11,
+        )
+        style.map("VS.Vertical.TScrollbar", background=[("active", COLORS["button_hover"])])
+        style.configure("Toolbar.TButton", padding=(8, 3))
         style.configure(
             "Running.TLabel", background=COLORS["bg"], foreground=COLORS["accent"],
             font=(self.ui_font, 9, "bold"),
@@ -300,7 +347,9 @@ class TreeAgentApp:
         menubar = tk.Menu(self.root)
         self._menus: list[tk.Menu] = [menubar]
 
-        file_menu = tk.Menu(menubar, tearoff=0)
+        # Menus belong to the root so they can be used both by the native
+        # menu bar (light mode) and as independent popups (dark mode).
+        file_menu = tk.Menu(self.root, tearoff=0)
         self._menus.append(file_menu)
         file_menu.add_command(label="新增最上層專案", command=lambda: self.new_project(top_level=True))
         file_menu.add_command(label="新增子專案", command=lambda: self.new_project(top_level=False))
@@ -318,7 +367,7 @@ class TreeAgentApp:
         file_menu.add_command(label="離開", command=self.on_close)
         menubar.add_cascade(label="檔案", menu=file_menu)
 
-        edit_menu = tk.Menu(menubar, tearoff=0)
+        edit_menu = tk.Menu(self.root, tearoff=0)
         self._menus.append(edit_menu)
         edit_menu.add_command(label="重新命名  (F2)", command=self.rename_selected)
         edit_menu.add_command(label="刪除  (Del)", command=self.delete_selected)
@@ -329,15 +378,8 @@ class TreeAgentApp:
         edit_menu.add_command(label="重設對話（清空並開新 thread）", command=self.reset_conversation)
         menubar.add_cascade(label="編輯", menu=edit_menu)
 
-        view_menu = tk.Menu(menubar, tearoff=0)
+        view_menu = tk.Menu(self.root, tearoff=0)
         self._menus.append(view_menu)
-        self.tool_display_var = tk.StringVar(value=self.tool_display)
-        for mode, label in TOOL_DISPLAY_LABELS:
-            view_menu.add_radiobutton(
-                label=label, value=mode, variable=self.tool_display_var,
-                command=self.apply_tool_display,
-            )
-        view_menu.add_separator()
         self.show_outline_var = tk.BooleanVar(value=self.show_outline)
         self.show_info_var = tk.BooleanVar(value=self.show_info)
         view_menu.add_checkbutton(label="顯示對話大綱（左）",
@@ -357,24 +399,73 @@ class TreeAgentApp:
                                   variable=self.theme_var, command=self.apply_theme)
         menubar.add_cascade(label="檢視", menu=view_menu)
 
-        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu = tk.Menu(self.root, tearoff=0)
         self._menus.append(help_menu)
         help_menu.add_command(label="關於", command=self.show_about)
         menubar.add_cascade(label="說明", menu=help_menu)
 
-        self.root.config(menu=menubar)
+        self.menubar = menubar
+        self.custom_menu_bar = tk.Frame(self.root, bg=COLORS["toolbar"], height=28)
+        self.custom_menu_bar.pack_propagate(False)
+        self.custom_menu_buttons: list[tk.Button] = []
+        for label, menu in (("檔案", file_menu), ("編輯", edit_menu), ("檢視", view_menu), ("說明", help_menu)):
+            # Menubutton's native menu binding does not open reliably when a
+            # Menu was also attached to the hidden Windows menu bar.  Posting
+            # the very same menu explicitly makes the dark title-bar controls
+            # behave like ordinary menu buttons.
+            button = tk.Button(
+                self.custom_menu_bar, text=label, bd=0, relief="flat",
+                bg=COLORS["toolbar"], fg=COLORS["text"], activebackground=COLORS["hover"],
+                activeforeground=COLORS["text"], font=(self.ui_font, 9), padx=9,
+            )
+            button.configure(command=lambda m=menu, b=button: self._post_menu(m, b))
+            button.pack(side="left", fill="y")
+            self.custom_menu_buttons.append(button)
         self._configure_menus()
+        self._apply_menu_mode()
         self.root.bind_all("<Control-f>", lambda e: self.focus_search())
         self.root.bind_all("<Control-F>", lambda e: self.focus_search())
+
+    @staticmethod
+    def _post_menu(menu: tk.Menu, button: tk.Widget) -> None:
+        """Open an in-window menu beneath its dark title-bar button."""
+        # ``post`` leaves normal mouse handling to Tk and returns straight
+        # away.  ``tk_popup`` can block a Button command on Windows when the
+        # original native menu bar has been detached for dark mode.
+        menu.post(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+
+    def _apply_menu_mode(self) -> None:
+        """Use an in-window dark menu bar: Windows native menus ignore colours."""
+        if self.theme == THEME_DARK:
+            self.root.config(menu="")
+            if not self.custom_menu_bar.winfo_ismapped():
+                options: dict[str, Any] = {"fill": "x", "side": "top"}
+                if hasattr(self, "outer"):
+                    options["before"] = self.outer
+                self.custom_menu_bar.pack(**options)
+        else:
+            self.custom_menu_bar.pack_forget()
+            self.root.config(menu=self.menubar)
 
     # ------------------------------------------------------------- layout
 
     def _build_layout(self) -> None:
-        outer = ttk.Frame(self.root, style="TFrame")
+        self.outer = outer = ttk.Frame(self.root, style="TFrame")
         outer.pack(fill="both", expand=True)
 
+        # A single functional VS Code-style activity rail.  It focuses the
+        # workspace explorer rather than pretending this app has extra modes.
+        self.activity_rail = tk.Frame(outer, bg=COLORS["activity"], width=44)
+        self.activity_rail.pack_propagate(False)
+        self.activity_button = tk.Button(
+            self.activity_rail, text="▦", bd=0, relief="flat", padx=0, pady=8,
+            bg=COLORS["activity"], fg=COLORS["accent"], activebackground=COLORS["hover"],
+            activeforeground=COLORS["accent"], font=(self.ui_font, 16),
+            command=lambda: self.tree.focus_set(),
+        )
+        self.activity_button.pack(fill="x", pady=(4, 0))
+
         self.paned = ttk.PanedWindow(outer, orient="horizontal")
-        self.paned.pack(fill="both", expand=True, padx=8, pady=(8, 4))
 
         self._build_tree_pane()
         self._build_detail_pane()
@@ -385,9 +476,25 @@ class TreeAgentApp:
         self._sash_job = self.root.after(80, lambda: self._set_sash(ui.get("sash", 300)))
 
         self.status = ttk.Label(outer, text="", style="Muted.TLabel", anchor="w")
-        self.status.pack(fill="x", padx=12, pady=(0, 6))
+        # The main paned window was packed to the left while this label used
+        # Tk's default top side.  Pack then allocated a right-hand strip to
+        # the status label, leaving a permanent empty area beside the info
+        # rail.  Reserving the status row at the bottom lets the workspace
+        # (and therefore the info panel) use the full remaining width.
+        self.status.pack(side="bottom", fill="x", padx=8, pady=(3, 4))
+        self.paned.pack(side="left", fill="both", expand=True)
         version = codex_runner.codex_version()
         self.set_status(f"就緒 · {version}" if version else "找不到 codex CLI，請確認已安裝並在 PATH 中")
+        self._apply_theme_layout()
+
+    def _apply_theme_layout(self) -> None:
+        if self.theme == THEME_DARK:
+            if not self.activity_rail.winfo_ismapped():
+                self.activity_rail.pack(side="left", fill="y", before=self.paned)
+            self.paned.pack_configure(padx=0, pady=0)
+        else:
+            self.activity_rail.pack_forget()
+            self.paned.pack_configure(padx=8, pady=(8, 4))
 
     def _set_sash(self, position: int) -> None:
         try:
@@ -396,11 +503,11 @@ class TreeAgentApp:
             pass
 
     def _build_tree_pane(self) -> None:
-        left = ttk.Frame(self.paned, style="TFrame")
+        left = ttk.Frame(self.paned, style="Sidebar.TFrame")
         self.paned.add(left, weight=0)
 
-        bar = ttk.Frame(left, style="TFrame")
-        bar.pack(fill="x", pady=(0, 6))
+        bar = ttk.Frame(left, style="Sidebar.TFrame")
+        bar.pack(fill="x", pady=(4, 4))
         ttk.Label(bar, text="專案", style="Section.TLabel").pack(side="left")
         # Packed right-to-left, so the tuple is reversed to read left-to-right
         # on screen: ＋專案  ＋子專案  ＋對話.
@@ -414,15 +521,15 @@ class TreeAgentApp:
             _Tooltip(btn, tip)
 
         search_row = tk.Frame(left, bg=COLORS["border"])
-        search_row.pack(fill="x", pady=(0, 6))
+        search_row.pack(fill="x", pady=(0, 4))
         self.search_var = tk.StringVar()
         self.search_entry = tk.Entry(
-            search_row, textvariable=self.search_var, bd=0, bg=COLORS["panel"],
+            search_row, textvariable=self.search_var, bd=0, bg=COLORS["input"],
             fg=COLORS["text"], font=(self.ui_font, 9), insertbackground=COLORS["text"],
         )
         self.search_entry.pack(side="left", fill="x", expand=True, padx=(6, 0), pady=3)
         self.search_clear = tk.Button(
-            search_row, text="✕", bd=0, bg=COLORS["panel"], fg=COLORS["muted"],
+            search_row, text="✕", bd=0, bg=COLORS["input"], fg=COLORS["muted"],
             font=(self.ui_font, 8), cursor="hand2", padx=6,
             command=self.clear_search,
         )
@@ -436,11 +543,15 @@ class TreeAgentApp:
         self._search_job: str | None = None
         self.search_query = ""
 
-        holder = ttk.Frame(left, style="TFrame")
+        holder = ttk.Frame(left, style="Sidebar.TFrame")
         holder.pack(fill="both", expand=True)
 
         self.tree = ttk.Treeview(holder, show="tree", selectmode="browse")
-        vsb = ttk.Scrollbar(holder, orient="vertical", command=self.tree.yview)
+        vsb = ttk.Scrollbar(
+            holder, orient="vertical", command=self.tree.yview,
+            style="VS.Vertical.TScrollbar",
+        )
+        self.tree_scrollbar = vsb
         self.tree.configure(yscrollcommand=vsb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
@@ -963,7 +1074,20 @@ class TreeAgentApp:
         self.root.configure(bg=COLORS["bg"])
         self._build_styles()
         self._configure_menus()
+        self._apply_menu_mode()
         self._replace_widget_colors(self.root, old)
+        self._apply_theme_layout()
+        # Several light surfaces intentionally share white; restore the
+        # distinct Dark+ layers that a one-to-one colour replacement cannot
+        # infer from those duplicate source values.
+        self.search_entry.configure(bg=COLORS["input"])
+        self.search_clear.configure(bg=COLORS["input"])
+        self.conv_view.text.configure(bg=COLORS["editor"])
+        self.conv_view.input.configure(bg=COLORS["input"])
+        self.conv_view.outline.configure(bg=COLORS["sidebar"])
+        self.conv_view.outline_body.configure(bg=COLORS["sidebar"])
+        self.conv_view.info.configure(bg=COLORS["sidebar"])
+        self.conv_view.info_body.configure(bg=COLORS["sidebar"])
         self.tree.tag_configure("project", foreground=COLORS["text"])
         self.tree.tag_configure("conversation", foreground=COLORS["tree_conversation"])
         self.tree.tag_configure("running", foreground=COLORS["accent"])
@@ -974,8 +1098,8 @@ class TreeAgentApp:
         self.set_status("已切換為" + ("深色模式" if self.theme == THEME_DARK else "淺色模式"))
 
     def apply_tool_display(self) -> None:
-        """Switch how command executions are drawn and redraw the transcript."""
-        self.tool_display = self.tool_display_var.get()
+        """Compatibility hook: central transcripts always hide tool calls."""
+        self.tool_display = TOOL_HIDDEN
         self.ws.data.setdefault("ui", {})["tool_display"] = self.tool_display
         self.ws.touch()
         conv = self.ws.find(self.current_id)
@@ -983,9 +1107,7 @@ class TreeAgentApp:
             offset = self.conv_view.text.yview()[0]
             self.conv_view.show(conv)
             self.conv_view.text.yview_moveto(offset)
-        self.set_status(
-            "工具輸出：" + dict(TOOL_DISPLAY_LABELS).get(self.tool_display, self.tool_display)
-        )
+        self.set_status("工具紀錄會顯示在右側資訊面板")
 
     def copy_transcript(self) -> None:
         node = self.ws.find(self.selected_id())
@@ -1412,6 +1534,8 @@ class TreeAgentApp:
             self.ws.append_message(conv_id, role, text, **({"agent_id": agent_id} if role == "agent" else {}))
             if visible:
                 self.conv_view.append(role, text, agent_id=agent_id if role == "agent" else None)
+                if role == "tool":
+                    self.conv_view.refresh_info()
             self.refresh_node_label(conv_id)
         elif kind == "usage":
             total = self.ws.add_usage(conv_id, event.get("usage") or {})
@@ -1603,7 +1727,7 @@ class ConversationView(ttk.Frame):
             bd=0,
             padx=TEXT_INSET_PX,
             pady=12,
-            bg=COLORS["panel"],
+            bg=COLORS["editor"],
             fg=COLORS["text"],
             font=(app.ui_font, 10),
             state="disabled",
@@ -1619,7 +1743,10 @@ class ConversationView(ttk.Frame):
             # otherwise the highlight vanishes before you can copy it.
             inactiveselectbackground=COLORS["select_idle"],
         )
-        vsb = ttk.Scrollbar(body, orient="vertical", command=self.text.yview)
+        vsb = ttk.Scrollbar(
+            body, orient="vertical", command=self.text.yview,
+            style="VS.Vertical.TScrollbar",
+        )
         self._vsb = vsb
         self.text.configure(yscrollcommand=self._on_scroll)
         self.text.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
@@ -1655,7 +1782,7 @@ class ConversationView(ttk.Frame):
             bd=0,
             padx=10,
             pady=8,
-            bg=COLORS["panel"],
+            bg=COLORS["input"],
             fg=COLORS["text"],
             font=(app.ui_font, 10),
             undo=True,
@@ -1667,7 +1794,7 @@ class ConversationView(ttk.Frame):
 
         side = ttk.Frame(composer, style="TFrame")
         side.grid(row=0, column=1, sticky="ns", padx=(8, 0))
-        self.send_button = ttk.Button(side, text="送出\nEnter", command=self.on_send, width=12)
+        self.send_button = ttk.Button(side, text="送出\nEnter", style="Primary.TButton", command=self.on_send, width=12)
         self.send_button.pack(fill="x")
         self.stop_button = ttk.Button(side, text="停止", command=self.on_stop, width=12, state="disabled")
         self.stop_button.pack(fill="x", pady=(6, 0))
@@ -1683,27 +1810,27 @@ class ConversationView(ttk.Frame):
 
     def _build_outline(self) -> None:
         """The navigation rail: your questions and Codex's headings."""
-        self.outline = tk.Frame(self.splitter, bg=COLORS["bg"],
+        self.outline = tk.Frame(self.splitter, bg=COLORS["sidebar"],
                                 width=self.app.outline_width)
         # The children are packed, so pack_propagate is what stops them forcing
         # the rail wider than the sash puts it.
         self.outline.pack_propagate(False)
-        ttk.Label(self.outline, text="大綱", style="Section.TLabel").pack(
+        ttk.Label(self.outline, text="大綱", style="Sidebar.Section.TLabel").pack(
             anchor="w", pady=(0, 4)
         )
-        self.outline_body = tk.Frame(self.outline, bg=COLORS["bg"])
+        self.outline_body = tk.Frame(self.outline, bg=COLORS["sidebar"])
         self.outline_body.pack(fill="both", expand=True)
         self._outline_targets: list[str] = []
 
     def _build_info(self) -> None:
         """The details panel: settings, usage, attachments, changed files."""
-        self.info = tk.Frame(self.splitter, bg=COLORS["bg"],
+        self.info = tk.Frame(self.splitter, bg=COLORS["sidebar"],
                              width=self.app.info_width)
         self.info.pack_propagate(False)
-        ttk.Label(self.info, text="資訊", style="Section.TLabel").pack(
+        ttk.Label(self.info, text="資訊", style="Sidebar.Section.TLabel").pack(
             anchor="w", pady=(0, 4)
         )
-        self.info_body = tk.Frame(self.info, bg=COLORS["bg"])
+        self.info_body = tk.Frame(self.info, bg=COLORS["sidebar"])
         self.info_body.pack(fill="both", expand=True)
         self._info_thumbs: list[tk.PhotoImage] = []
 
@@ -1871,7 +1998,7 @@ class ConversationView(ttk.Frame):
             row = tk.Label(
                 self.outline_body,
                 text=("你  " if depth == 0 else "　" * depth) + trimmed,
-                bg=COLORS["bg"],
+                bg=COLORS["sidebar"],
                 fg=COLORS["user"] if depth == 0 else COLORS["muted"],
                 font=(self.app.ui_font, 9, "bold" if depth == 0 else "normal"),
                 anchor="w", justify="left", cursor="hand2", padx=2,
@@ -1879,7 +2006,7 @@ class ConversationView(ttk.Frame):
             row.pack(fill="x")
             row.bind("<Button-1>", lambda e, i=index: self.jump_to(i))
             row.bind("<Enter>", lambda e, w=row: w.configure(bg=COLORS["user_bg"]))
-            row.bind("<Leave>", lambda e, w=row: w.configure(bg=COLORS["bg"]))
+            row.bind("<Leave>", lambda e, w=row: w.configure(bg=COLORS["sidebar"]))
             self._outline_targets.append(index)
 
     def jump_to(self, index: str) -> None:
@@ -1923,7 +2050,7 @@ class ConversationView(ttk.Frame):
 
         for name, value in rows:
             ttk.Label(self.info_body, text=name, style="Muted.TLabel").pack(anchor="w")
-            tk.Label(self.info_body, text=value, bg=COLORS["bg"], fg=COLORS["text"],
+            tk.Label(self.info_body, text=value, bg=COLORS["sidebar"], fg=COLORS["text"],
                      font=(self.app.mono_font, 8), anchor="w", justify="left",
                      wraplength=INFO_WIDTH - 16).pack(anchor="w", pady=(0, 6))
 
@@ -1931,14 +2058,14 @@ class ConversationView(ttk.Frame):
         if images:
             ttk.Label(self.info_body, text=f"附件（{len(images)}）",
                       style="Muted.TLabel").pack(anchor="w", pady=(4, 2))
-            strip = tk.Frame(self.info_body, bg=COLORS["bg"])
+            strip = tk.Frame(self.info_body, bg=COLORS["sidebar"])
             strip.pack(anchor="w")
             for path in images[:6]:
                 thumb = self._thumbnail(path)
                 if thumb is None:
                     continue
                 self._info_thumbs.append(thumb)
-                holder = tk.Label(strip, image=thumb, bg=COLORS["bg"], cursor="hand2")
+                holder = tk.Label(strip, image=thumb, bg=COLORS["sidebar"], cursor="hand2")
                 holder.pack(side="left", padx=(0, 4))
                 holder.bind("<Button-1>", lambda e, p=path: self._open_path(p))
 
@@ -1954,11 +2081,14 @@ class ConversationView(ttk.Frame):
                     if entry and entry not in seen:
                         seen.append(entry)
             for entry in seen[:12]:
-                tk.Label(self.info_body, text=entry, bg=COLORS["bg"], fg=COLORS["tool"],
+                tk.Label(self.info_body, text=entry, bg=COLORS["sidebar"], fg=COLORS["tool"],
                          font=(self.app.mono_font, 8), anchor="w", justify="left",
                          wraplength=INFO_WIDTH - 16).pack(anchor="w")
 
-        tool_events = [m["text"] for m in conv["messages"] if m["role"] == "agent_tool"]
+        tool_events = [
+            m["text"] for m in conv["messages"]
+            if m["role"] in ("tool", "agent_tool")
+        ]
         if tool_events:
             ttk.Label(self.info_body, text=f"工具紀錄（{len(tool_events)}）",
                       style="Muted.TLabel").pack(anchor="w", pady=(10, 2))
@@ -1970,7 +2100,8 @@ class ConversationView(ttk.Frame):
                 padx=6, pady=5, bg=COLORS["panel"], fg=COLORS["tool"],
                 font=(self.app.mono_font, 8), state="normal", cursor="arrow",
             )
-            bar = ttk.Scrollbar(holder, orient="vertical", command=log.yview)
+            bar = ttk.Scrollbar(holder, orient="vertical", command=log.yview,
+                                style="VS.Vertical.TScrollbar")
             log.configure(yscrollcommand=bar.set)
             log.grid(row=0, column=0, sticky="ew", padx=(1, 0), pady=1)
             bar.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
@@ -2357,6 +2488,10 @@ class ConversationView(ttk.Frame):
         # Also applied here, not just on ingest, so transcripts recorded before
         # the escape stripping existed still render cleanly.
         text = codex_runner.clean_output(text)
+        # Do this before adding a separator: hidden tool calls must not leave
+        # empty gaps between the actual conversation messages.
+        if role == "tool":
+            return
         if images:
             # Older transcripts baked the file names into the message text;
             # they are drawn from `images` now, so drop the duplicated lines.
@@ -2377,50 +2512,14 @@ class ConversationView(ttk.Frame):
             # Only the agent's prose is Markdown; command output and the user's
             # own text are shown exactly as written.
             richtext.insert(self.text, text.strip(), (body_tag,))
-        elif role == "tool":
-            self._write_tool(text, body_tag)
         elif text:
             self.text.insert("end", text.rstrip() + "\n", body_tag)
         for path in images or ():
             self._write_attachment(path, body_tag)
 
     def _write_tool(self, text: str, body_tag: str) -> None:
-        """Draw a command execution, collapsed to one clickable line by default.
-
-        The output is inserted either way and hidden with the tag's `elide`
-        option, so expanding is instant and does not disturb the scroll position
-        — and Ctrl+A still copies the full output even while it is hidden.
-        """
-        mode = self.app.tool_display
-        if mode == TOOL_HIDDEN:
-            return
-        text = text.rstrip()
-        if mode == TOOL_FULL or "\n" not in text:
-            self.text.insert("end", text + "\n", body_tag)
-            return
-
-        head, _, rest = text.partition("\n")
-        summary = head if len(head) <= TOOL_SUMMARY_CHARS else head[:TOOL_SUMMARY_CHARS] + "…"
-        key = len(self._tool_blocks)
-        closed, opened = f"toolarrowc{key}", f"toolarrowo{key}"
-        head_tag, body_id = f"toolhead{key}", f"toolbody{key}"
-
-        # Both arrows are inserted once; toggling only flips which one is elided,
-        # so the widget never has to be edited again.
-        self.text.insert("end", "▸ ", (body_tag, closed, head_tag))
-        self.text.insert("end", "▾ ", (body_tag, opened, head_tag))
-        self.text.insert("end", summary, (body_tag, head_tag))
-        self.text.insert("end", f"    （{rest.count(chr(10)) + 1} 行輸出）\n",
-                         (body_tag, head_tag, "tool_hint"))
-        self.text.insert("end", rest + "\n", (body_tag, body_id))
-
-        self.text.tag_configure(opened, elide=True)
-        self.text.tag_configure(body_id, elide=True)
-        self.text.tag_configure(head_tag, foreground=COLORS["accent"])
-        self.text.tag_bind(head_tag, "<Button-1>", lambda e, k=key: self._toggle_tool(k))
-        self.text.tag_bind(head_tag, "<Enter>", lambda e: self.text.configure(cursor="hand2"))
-        self.text.tag_bind(head_tag, "<Leave>", lambda e: self.text.configure(cursor="xterm"))
-        self._tool_blocks.append((closed, opened, body_id))
+        """Tool calls belong to the right-side audit log, never the answer."""
+        return
 
     def _toggle_tool(self, key: int) -> None:
         try:

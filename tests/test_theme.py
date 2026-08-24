@@ -2,6 +2,7 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tempfile, tkinter as tk
+from tkinter import ttk
 from tree_agent.app import (
     COLORS, DARK_COLORS, LIGHT_COLORS, THEME_DARK, THEME_LIGHT, TreeAgentApp,
 )
@@ -21,8 +22,12 @@ root.update()
 assert app.theme == THEME_DARK
 assert COLORS == DARK_COLORS, COLORS
 assert app.ws.data["ui"]["theme"] == THEME_DARK
-assert app.search_entry.cget("background") == DARK_COLORS["panel"]
-assert app.conv_view.text.cget("background") == DARK_COLORS["panel"]
+assert str(app.search_entry.cget("background")) == DARK_COLORS["input"]
+assert str(app.conv_view.text.cget("background")) == DARK_COLORS["editor"]
+assert str(app.tree_scrollbar.cget("style")) == "VS.Vertical.TScrollbar"
+assert str(app.conv_view._vsb.cget("style")) == "VS.Vertical.TScrollbar"
+style = ttk.Style(root)
+assert style.lookup("Primary.TButton", "foreground", state=("disabled",)) == DARK_COLORS["text"]
 assert app.tree.tag_configure("conversation")["foreground"] == DARK_COLORS["tree_conversation"]
 assert str(app._menus[0].cget("background")) == DARK_COLORS["panel"]
 print("dark mode updates classic widgets, transcript tags, and tree tags OK")
@@ -38,7 +43,11 @@ app2.theme_var.set(THEME_LIGHT)
 app2.apply_theme()
 root2.update()
 assert COLORS == LIGHT_COLORS
-assert app2.search_entry.cget("background") == LIGHT_COLORS["panel"]
+assert str(app2.search_entry.cget("background")) == LIGHT_COLORS["input"]
+style = ttk.Style(root2)
+assert style.lookup("Primary.TButton", "background", state=("disabled",)) == LIGHT_COLORS["tool_bg"]
+assert style.lookup("Primary.TButton", "foreground", state=("disabled",)) == LIGHT_COLORS["text"]
+assert style.lookup("Primary.TButton", "foreground") == LIGHT_COLORS["text"]
 print("switching back to light mode updates live widgets OK")
 
 app2.on_close()
