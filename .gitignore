@@ -1,0 +1,18 @@
+# Python bytecode and test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local environments and editor settings
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Tree Agent runtime workspace (when --home points inside this repository)
+.tree_agent/
+attachments/
