@@ -20,6 +20,7 @@ import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 if __package__ in (None, ""):  # allow `python app.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -2120,6 +2121,7 @@ class ConversationView(ttk.Frame):
         # Ctrl+Enter should still send, even when the transcript holds focus.
         self.text.bind("<Control-Return>", self._on_send_key)
         self.text.bind("<Button-3>", self._transcript_menu)
+        self.text.tag_bind("md_link", "<Button-1>", self._markdown_link_menu)
         self.input.bind("<Button-3>", self._input_menu)
         # Ctrl+V attaches a screenshot when the clipboard holds one, and
         # otherwise falls through to Tk's ordinary text paste.
@@ -2536,7 +2538,7 @@ class ConversationView(ttk.Frame):
         tag = f"imgopen{len(self._link_targets)}"
         self._link_targets[tag] = path
         self.text.tag_configure(tag, foreground=COLORS["accent"], underline=True)
-        self.text.tag_bind(tag, "<Button-1>", lambda e, t=tag: self._open_link(t))
+        self.text.tag_bind(tag, "<Button-1>", lambda e, t=tag: self._file_link_menu(e, self._link_targets[t]))
         self.text.tag_bind(tag, "<Enter>", lambda e: self.text.configure(cursor="hand2"))
         self.text.tag_bind(tag, "<Leave>", lambda e: self.text.configure(cursor="xterm"))
 
@@ -2557,6 +2559,57 @@ class ConversationView(ttk.Frame):
         path = self._link_targets.get(tag)
         if path:
             self._open_path(path)
+
+    def _markdown_link_menu(self, event):
+        """Offer the file action only for a local Markdown link."""
+        index = self.text.index(f"@{event.x},{event.y}")
+        line_start, line_end = f"{index} linestart", f"{index} lineend"
+        line = self.text.get(line_start, line_end)
+        # richtext renders `[name](file:///C:/x)` as `name ⟨file:///C:/x⟩`.
+        match = re.search(r"⟨([^⟩]+)⟩", line)
+        target = match.group(1) if match else ""
+        if not target:
+            # A Markdown link whose label equals its URL has no muted target
+            # appended, so read the text covered by the clicked link tag.
+            ranges = self.text.tag_ranges("md_link")
+            for start, end in zip(ranges[::2], ranges[1::2]):
+                if self.text.compare(start, "<=", index) and self.text.compare(index, "<", end):
+                    target = self.text.get(start, end)
+                    break
+        path = self._local_link_path(target)
+        if path:
+            self._file_link_menu(event, path)
+            return "break"
+        return None
+
+    @staticmethod
+    def _local_link_path(target: str) -> str | None:
+        if target.startswith("file://"):
+            parsed = urlparse(target)
+            path = unquote(parsed.path)
+            # file:///C:/... turns into /C:/... when parsed on Windows.
+            if os.name == "nt" and re.match(r"^/[A-Za-z]:", path):
+                path = path[1:]
+            return path
+        if re.match(r"^[A-Za-z]:[\\/]", target) or target.startswith("\\\\"):
+            return target
+        return None
+
+    def _file_link_menu(self, event, path: str):
+        """Context action for underlined local-file links."""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="開啟", command=lambda: self._open_path(path))
+        menu.add_command(label="複製完整路徑", command=lambda: self._copy_file_path(path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _copy_file_path(self, path: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(path)
+        self.app.set_status("已複製完整檔案路徑")
 
     def _open_path(self, path: str) -> None:
         if not os.path.isfile(path):
