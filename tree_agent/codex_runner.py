@@ -41,6 +41,25 @@ SANDBOX_LABELS = {
     NO_SANDBOX: "no-sandbox — 最高權限，並跳過核准機制",
 }
 
+CLAUDE_PERMISSION_DEFAULT = "default"
+CLAUDE_PERMISSION_BYPASS = "bypass"
+CLAUDE_PERMISSION_LABELS = {
+    CLAUDE_PERMISSION_DEFAULT: "default — 依 Claude Code 標準核准",
+    CLAUDE_PERMISSION_BYPASS: "bypass — 略過 Claude Code 的核准",
+}
+
+
+def claude_permission_label(mode: str | None) -> str:
+    return CLAUDE_PERMISSION_LABELS.get(mode or CLAUDE_PERMISSION_DEFAULT,
+                                        CLAUDE_PERMISSION_LABELS[CLAUDE_PERMISSION_DEFAULT])
+
+
+def claude_permission_from_label(label: str) -> str:
+    for mode, text in CLAUDE_PERMISSION_LABELS.items():
+        if label == text:
+            return mode
+    return CLAUDE_PERMISSION_DEFAULT
+
 # Only these two build the restricted-user sandbox, and only they break on a
 # mapped network drive. Verified against codex 0.147 on \\\\192.168.1.146\\d$:
 # read-only and workspace-write fail with 267, danger-full-access writes fine.
@@ -475,9 +494,10 @@ class ClaudeTurn:
 
     def __init__(self, prompt: str, cwd: str, emit: Callable[[dict[str, Any]], None],
                  session_id: str | None = None, model: str | None = None,
-                 executable: str | None = None) -> None:
+                 executable: str | None = None, permission_mode: str | None = None) -> None:
         self.prompt, self.cwd, self.emit = prompt, cwd, emit
         self.session_id, self.model, self.executable = session_id, model, executable
+        self.permission_mode = permission_mode or CLAUDE_PERMISSION_DEFAULT
         self.proc: subprocess.Popen[str] | None = None
         self._cancelled = False
         self._lock = threading.Lock()
@@ -488,6 +508,10 @@ class ClaudeTurn:
             cmd += ["--resume", self.session_id]
         if self.model:
             cmd += ["--model", self.model]
+        if self.permission_mode == CLAUDE_PERMISSION_BYPASS:
+            # Print mode cannot present an approval dialog.  This explicit
+            # flag is Claude Code's non-interactive opt-in to run tools.
+            cmd += ["--dangerously-skip-permissions"]
         return cmd
 
     def describe_command(self) -> str:

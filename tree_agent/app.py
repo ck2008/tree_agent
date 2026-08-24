@@ -1342,6 +1342,7 @@ class TreeAgentApp:
                 prompt=outgoing, cwd=settings["cwd"], emit=emit,
                 session_id=conv.get("claude_session_id"), model=settings.get("model"),
                 executable=self.ws.agent_path(store.CLAUDE_AGENT),
+                permission_mode=settings.get("claude_permission"),
             )
         else:
             turn = codex_runner.Turn(
@@ -2492,7 +2493,7 @@ class ConversationView(ttk.Frame):
         text = codex_runner.clean_output(text)
         # Do this before adding a separator: hidden tool calls must not leave
         # empty gaps between the actual conversation messages.
-        if role == "tool":
+        if role in ("tool", "agent_tool"):
             return
         if images:
             # Older transcripts baked the file names into the message text;
@@ -2766,9 +2767,21 @@ class ProjectView(ttk.Frame):
         self.sandbox_hint = ttk.Label(form, text="", style="Muted.TLabel")
         self.sandbox_hint.grid(row=5, column=1, sticky="w", padx=(10, 0))
 
-        ttk.Label(form, text="提示詞", style="TLabel").grid(row=6, column=0, sticky="nw", pady=4)
+        ttk.Label(form, text="Claude 權限", style="TLabel").grid(row=6, column=0, sticky="w", pady=4)
+        self.claude_permission_var = tk.StringVar()
+        ttk.Combobox(
+            form,
+            textvariable=self.claude_permission_var,
+            values=(INHERIT,) + tuple(codex_runner.CLAUDE_PERMISSION_LABELS.values()),
+            state="readonly",
+            width=46,
+        ).grid(row=6, column=1, sticky="w", padx=(10, 0))
+        self.claude_permission_hint = ttk.Label(form, text="", style="Muted.TLabel")
+        self.claude_permission_hint.grid(row=7, column=1, sticky="w", padx=(10, 0))
+
+        ttk.Label(form, text="提示詞", style="TLabel").grid(row=8, column=0, sticky="nw", pady=4)
         prompt_wrap = tk.Frame(form, bg=COLORS["border"])
-        prompt_wrap.grid(row=6, column=1, sticky="ew", padx=(10, 0))
+        prompt_wrap.grid(row=8, column=1, sticky="ew", padx=(10, 0))
         self.prompt_text = tk.Text(
             prompt_wrap, height=5, wrap="word", bd=0, padx=8, pady=6,
             bg=COLORS["panel"], fg=COLORS["text"], font=(app.ui_font, 9), undo=True,
@@ -2776,7 +2789,7 @@ class ProjectView(ttk.Frame):
         self.prompt_text.pack(fill="both", expand=True, padx=1, pady=1)
         self.prompt_hint = ttk.Label(form, text="", style="Muted.TLabel",
                                      wraplength=620, justify="left")
-        self.prompt_hint.grid(row=7, column=1, sticky="w", padx=(10, 0), pady=(2, 0))
+        self.prompt_hint.grid(row=9, column=1, sticky="w", padx=(10, 0), pady=(2, 0))
 
         actions = ttk.Frame(self, style="TFrame")
         actions.grid(row=3, column=0, sticky="w", pady=(18, 0))
@@ -2827,6 +2840,15 @@ class ProjectView(ttk.Frame):
             text=f"繼承值：{ws.inherited(project['id'], 'model') or '(config 預設)'}"
         )
         self.sandbox_hint.configure(text=f"繼承值：{ws.inherited(project['id'], 'sandbox')}")
+        self.claude_permission_var.set(
+            codex_runner.claude_permission_label(project.get("claude_permission"))
+            if project.get("claude_permission") else INHERIT
+        )
+        self.claude_permission_hint.configure(
+            text="繼承值：" + codex_runner.claude_permission_label(
+                ws.inherited(project["id"], "claude_permission")
+            )
+        )
 
         self.prompt_text.delete("1.0", "end")
         if project.get("prompt"):
@@ -2872,6 +2894,7 @@ class ProjectView(ttk.Frame):
             messagebox.showwarning(APP_NAME, f"目錄不存在：\n{cwd}", parent=self)
             return
         sandbox = self.sandbox_var.get()
+        claude_permission = self.claude_permission_var.get()
         ws = self.app.ws
         ws.set_option(self.project_id, "cwd", cwd)
         ws.set_option(self.project_id, "model", self.model_var.get().strip())
@@ -2880,6 +2903,12 @@ class ProjectView(ttk.Frame):
             self.project_id,
             "sandbox",
             "" if sandbox == INHERIT else codex_runner.sandbox_from_label(sandbox),
+        )
+        ws.set_option(
+            self.project_id,
+            "claude_permission",
+            "" if claude_permission == INHERIT
+            else codex_runner.claude_permission_from_label(claude_permission),
         )
         self.show(ws.find(self.project_id))
         self.app.set_status("已儲存專案設定")

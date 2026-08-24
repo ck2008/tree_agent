@@ -22,6 +22,7 @@ CONVERSATION = "conversation"
 CODEX_AGENT = "codex"
 CLAUDE_AGENT = "claude"
 DEFAULT_AGENT = CODEX_AGENT
+DEFAULT_CLAUDE_PERMISSION = "default"
 
 DEFAULT_HOME = os.path.join(os.path.expanduser("~"), ".tree_agent")
 
@@ -140,6 +141,9 @@ def new_project(name: str) -> dict[str, Any]:
         "cwd": None,
         "model": None,
         "sandbox": None,
+        # Claude Code has its own permission model; this is deliberately
+        # separate from Codex's sandbox setting.
+        "claude_permission": None,
         # Free-form instructions for Codex. Unlike the settings above, these
         # accumulate down the tree instead of overriding — a client-wide rule
         # plus a subsystem-specific one is more useful than either alone.
@@ -225,6 +229,7 @@ class Workspace:
                 "cwd": default_cwd(),
                 "model": None,
                 "sandbox": DEFAULT_SANDBOX,
+                "claude_permission": DEFAULT_CLAUDE_PERMISSION,
             },
             "projects": [],
             "ui": {},
@@ -417,11 +422,12 @@ class Workspace:
     # ------------------------------------------------------------- settings
 
     def resolve(self, node_id: str) -> dict[str, Any]:
-        """Effective cwd / model / sandbox for a node, walking up the tree."""
+        """Effective inherited execution settings for a node."""
         node = self.find(node_id)
         chain = ([node] if node else []) + self.ancestors(node_id)
         out = dict(self.defaults)
-        for key in ("cwd", "model", "sandbox"):
+        out.setdefault("claude_permission", DEFAULT_CLAUDE_PERMISSION)
+        for key in ("cwd", "model", "sandbox", "claude_permission"):
             for candidate in chain:
                 value = candidate.get(key)
                 if value:

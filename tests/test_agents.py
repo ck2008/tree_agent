@@ -12,9 +12,12 @@ conv = ws.projects[0]["children"][0]
 assert ws.conversation_agent(conv["id"]) == store.CODEX_AGENT
 ws.set_conversation_agent(conv["id"], store.CLAUDE_AGENT)
 ws.set_agent_path(store.CLAUDE_AGENT, "")
+ws.set_option(ws.projects[0]["id"], "claude_permission", cr.CLAUDE_PERMISSION_BYPASS)
+assert ws.resolve(conv["id"])["claude_permission"] == cr.CLAUDE_PERMISSION_BYPASS
 ws2 = store.Workspace(home)
 assert ws2.conversation_agent(conv["id"]) == store.CLAUDE_AGENT
 assert ws2.agent_path(store.CLAUDE_AGENT) is None
+assert ws2.resolve(conv["id"])["claude_permission"] == cr.CLAUDE_PERMISSION_BYPASS
 print("conversation Agent defaults to Codex and persists its selection OK")
 
 events = []
@@ -26,6 +29,11 @@ assert events == [
     {"kind": "item", "role": "agent", "text": "hello"},
 ], events
 print("Claude stream init and assistant text events map to the UI protocol OK")
+
+bypass = cr.ClaudeTurn("hi", ".", events.append, permission_mode=cr.CLAUDE_PERMISSION_BYPASS)
+assert "--dangerously-skip-permissions" in bypass.build_command()
+assert "--dangerously-skip-permissions" not in turn.build_command()
+print("Claude bypass permission is passed to non-interactive CLI OK")
 
 root = tk.Tk()
 app = TreeAgentApp(root, home=tempfile.mkdtemp(), single_instance=False)
@@ -49,6 +57,12 @@ assert "工具：Read" not in view.text.get("1.0", "end")
 tool_logs = [w for holder in view.info_body.winfo_children() for w in holder.winfo_children()
              if isinstance(w, tk.Text)]
 assert tool_logs and "1. 工具：Read" in tool_logs[-1].get("1.0", "end")
+# Imported / older workspaces can already contain agent_tool records.  They
+# must be hidden when the transcript is rebuilt too, not just while streaming.
+app.ws.append_message(node["id"], "agent_tool", "工具：Bash")
+view.show(app.ws.find(node["id"])); root.update()
+assert "agent_tool" not in view.text.get("1.0", "end")
+assert "工具：Bash" not in view.text.get("1.0", "end")
 dialog = AgentsDialog(root, app)
 root.update()
 assert set(dialog.vars) == {store.CODEX_AGENT, store.CLAUDE_AGENT}
