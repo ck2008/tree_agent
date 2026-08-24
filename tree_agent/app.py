@@ -1660,6 +1660,7 @@ class ConversationView(ttk.Frame):
         self._inline_images: list[tk.PhotoImage] = []
         self._link_targets: dict[str, str] = {}
         self._tool_blocks: list[tuple[str, str, str]] = []
+        self._shown_agent_labels: set[str] = set()
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -2347,11 +2348,6 @@ class ConversationView(ttk.Frame):
             "user", foreground=COLORS["user"], justify="right",
             lmargin1=90, lmargin2=90, rmargin=14, spacing1=1, spacing3=3,
         )
-        # A single tinted space on its own line, at a 1pt font: a 3px rule.
-        self.text.tag_configure(
-            "separator", background=COLORS["border"], font=(app.ui_font, 1),
-            spacing1=9, spacing3=9,
-        )
         self.text.tag_configure("agent", foreground=COLORS["agent"], lmargin1=12, lmargin2=12)
         self.text.tag_configure(
             "reasoning", foreground=COLORS["reasoning"], font=(app.ui_font, 9, "italic"),
@@ -2380,6 +2376,7 @@ class ConversationView(ttk.Frame):
         self._inline_images: list[tk.PhotoImage] = []
         self._link_targets: dict[str, str] = {}
         self._tool_blocks: list[tuple[str, str, str]] = []
+        self._shown_agent_labels = set()
         self.conv_id = conv["id"]
         self.input.delete("1.0", "end")
         draft = self.drafts.get(conv["id"])
@@ -2491,26 +2488,26 @@ class ConversationView(ttk.Frame):
         # Also applied here, not just on ingest, so transcripts recorded before
         # the escape stripping existed still render cleanly.
         text = codex_runner.clean_output(text)
-        # Do this before adding a separator: hidden tool calls must not leave
-        # empty gaps between the actual conversation messages.
+        # Hidden tool calls never leave a visible marker in the transcript.
         if role in ("tool", "agent_tool"):
             return
         if images:
             # Older transcripts baked the file names into the message text;
             # they are drawn from `images` now, so drop the duplicated lines.
             text = _ATTACHMENT_LINE.sub("", text).rstrip()
-        if self.text.index("end-1c") != "1.0":
-            self.text.insert("end", " \n", "separator")
         role_tag = {"user": "role_user", "agent": "role_agent"}.get(role, "role_other")
         body_tag = (
             role
             if role in ("user", "agent", "reasoning", "tool", "error", "notice", "meta")
             else "agent"
         )
-        if role != "meta":
-            label = (AGENT_LABELS.get(agent_id or self.app.ws.conversation_agent(self.conv_id or ""))
-                     if role == "agent" else ROLE_LABELS.get(role, role))
-            self.text.insert("end", label + "\n", role_tag)
+        if role == "agent":
+            label = AGENT_LABELS.get(agent_id or self.app.ws.conversation_agent(self.conv_id or ""))
+            if label not in self._shown_agent_labels:
+                self.text.insert("end", label + "\n", role_tag)
+                self._shown_agent_labels.add(label)
+        elif role != "meta":
+            self.text.insert("end", ROLE_LABELS.get(role, role) + "\n", role_tag)
         if role == "agent":
             # Only the agent's prose is Markdown; command output and the user's
             # own text are shown exactly as written.

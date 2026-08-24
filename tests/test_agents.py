@@ -63,6 +63,12 @@ app.ws.append_message(node["id"], "agent_tool", "工具：Bash")
 view.show(app.ws.find(node["id"])); root.update()
 assert "agent_tool" not in view.text.get("1.0", "end")
 assert "工具：Bash" not in view.text.get("1.0", "end")
+# A single conversation keeps one visual heading per Agent rather than
+# repeating "Codex CLI" above every streamed assistant message.
+app.ws.append_message(node["id"], "agent", "第一段", agent_id=store.CODEX_AGENT)
+app.ws.append_message(node["id"], "agent", "第二段", agent_id=store.CODEX_AGENT)
+view.show(app.ws.find(node["id"])); root.update()
+assert view.text.get("1.0", "end").count("Codex CLI\n") == 1
 dialog = AgentsDialog(root, app)
 root.update()
 assert set(dialog.vars) == {store.CODEX_AGENT, store.CLAUDE_AGENT}

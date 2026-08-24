@@ -35,15 +35,14 @@ root.geometry("1900x700"); root.update_idletasks(); root.update()
 print(f"text measure capped at "
       f"{view.text.winfo_width() - 2 * int(view.text.cget('padx'))}px OK")
 
-# ---- no full-width tinted band; messages are separated by a rule ----
+# ---- no full-width tinted band or separator rule ----
 assert str(view.text.tag_cget("user", "background")) == "", "the band must be gone"
 assert str(view.text.tag_cget("user", "justify")) == "right", "alignment still marks it"
 for i in range(3):
     app.ws.append_message(conv["id"], "agent" if i % 2 else "user", f"訊息 {i}")
 view.show(app.ws.find(conv["id"])); root.update()
-assert len(view.text.tag_ranges("separator")) // 2 == 2, "one rule between each pair"
-assert view.text.get("1.0", "1.end").strip() != "", "no leading rule before the first"
-print("band removed, separator rules between messages OK")
+assert not view.text.tag_ranges("separator"), "no grey separator rules"
+print("band and separator rules removed OK")
 
 # ---- streaming follows the tail only when you are already at the tail ----
 for i in range(300):

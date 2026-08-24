@@ -75,11 +75,10 @@ assert str(t.tag_cget("tool", "justify") or "left") == "left"
 assert int(t.tag_cget("user", "lmargin1")) > 0, "right-aligned text needs a left gutter"
 assert int(t.tag_cget("user", "rmargin")) > 0
 # No background tint: Tk paints a tag background across the whole line,
-# so it read as a full-width band rather than a bubble. Separation now
-# comes from the alignment, the label colour, and a rule between messages
-# (see test_reading).
+# so it read as a full-width band rather than a bubble. Separation comes
+# from alignment, spacing, and the label colour only.
 assert str(t.tag_cget("user", "background")) == "", t.tag_cget("user", "background")
-assert str(t.tag_cget("separator", "background")) != "", "a rule separates messages"
+assert not t.tag_ranges("separator"), "no grey separator rule"
 print("user right-aligned, Codex left-aligned OK")
 
 # and it holds for what is actually on screen
