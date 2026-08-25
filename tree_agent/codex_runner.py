@@ -494,10 +494,12 @@ class ClaudeTurn:
 
     def __init__(self, prompt: str, cwd: str, emit: Callable[[dict[str, Any]], None],
                  session_id: str | None = None, model: str | None = None,
-                 executable: str | None = None, permission_mode: str | None = None) -> None:
+                 executable: str | None = None, permission_mode: str | None = None,
+                 add_dirs: list[str] | None = None) -> None:
         self.prompt, self.cwd, self.emit = prompt, cwd, emit
         self.session_id, self.model, self.executable = session_id, model, executable
         self.permission_mode = permission_mode or CLAUDE_PERMISSION_DEFAULT
+        self.add_dirs = [path for path in (add_dirs or ()) if os.path.isdir(path)]
         self.proc: subprocess.Popen[str] | None = None
         self._cancelled = False
         self._lock = threading.Lock()
@@ -508,6 +510,8 @@ class ClaudeTurn:
             cmd += ["--resume", self.session_id]
         if self.model:
             cmd += ["--model", self.model]
+        for path in self.add_dirs:
+            cmd += ["--add-dir", path]
         if self.permission_mode == CLAUDE_PERMISSION_BYPASS:
             # Print mode cannot present an approval dialog.  This explicit
             # flag is Claude Code's non-interactive opt-in to run tools.

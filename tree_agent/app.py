@@ -17,16 +17,23 @@ import re
 import subprocess
 import time
 import sys
+import hashlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except ImportError:  # Keep the main UI usable if optional drag support is absent.
+    DND_FILES = None
+    TkinterDnD = None
 
 if __package__ in (None, ""):  # allow `python app.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from tree_agent import clipboard_image, codex_runner, richtext, store, transfer
+    from tree_agent import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
 else:
-    from . import clipboard_image, codex_runner, richtext, store, transfer
+    from . import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
 
 APP_NAME = "Tree Agent"
 
@@ -132,6 +139,10 @@ FLUSH_EVERY_TICKS = 8         # coalesce streamed message writes (~0.5s)
 THUMBNAIL_HEIGHT = 48         # attachment preview height, in pixels
 # Stand-in prompt when you attach images without typing anything.
 IMAGE_ONLY_PROMPT = "請看附加的圖片。"
+PDF_ONLY_PROMPT = "請分析附加的 PDF。"
+PDF_PAGE_LIMIT = 20
+PDF_TEXT_LIMIT = 60_000
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 
 # How much of a command execution to draw. Codex can emit hundreds of lines of
 # `git status` or a file listing, which buries the answer it was working towards.
@@ -169,6 +180,17 @@ PROGRESS_TICKS = 8            # refresh the elapsed counter about twice a second
 # Transcripts written before attachments were drawn from metadata carry the
 # file names inside the message text; this strips those duplicate lines.
 _ATTACHMENT_LINE = re.compile(r"^\s*🖼.*$", re.M)
+_FILE_CITATION = re.compile(r':codex-file-citation\{path="([^"]+)"[^}]*\}')
+
+
+def _file_citations_to_markdown(text: str) -> str:
+    """Turn an agent file citation into a clickable local Markdown link."""
+    def replace(match: re.Match[str]) -> str:
+        path = match.group(1)
+        label = os.path.basename(path.replace("\\", "/")) or path
+        url = "file:///" + quote(path.replace("\\", "/"), safe="/:")
+        return f"[{label}]({url})"
+    return _FILE_CITATION.sub(replace, text)
 
 
 def _enable_dpi_awareness() -> None:
@@ -1302,8 +1324,18 @@ class TreeAgentApp:
         images = list(images or ())
         settings = self.ws.resolve(conv_id)
         agent_id = self.ws.conversation_agent(conv_id)
-        if agent_id == store.CLAUDE_AGENT and images:
-            messagebox.showinfo(APP_NAME, "Claude Code 的第一版尚不支援圖片附件，請移除附件後再送出。")
+        page_limit = PDF_PAGE_LIMIT
+        if any(path.lower().endswith(".pdf") for path in images):
+            selected = simpledialog.askinteger(
+                APP_NAME, "PDF 最多處理幾頁？", initialvalue=PDF_PAGE_LIMIT,
+                minvalue=1, parent=self.root,
+            )
+            if selected is None:
+                return
+            page_limit = selected
+        prepared = self._prepare_attachments(images, page_limit=page_limit)
+        if prepared["errors"]:
+            messagebox.showwarning(APP_NAME, "\n".join(prepared["errors"]), parent=self.root)
             return
 
         # Project instructions ride along with the first message of a new
@@ -1313,7 +1345,9 @@ class TreeAgentApp:
         has_context = conv.get("claude_session_id") if agent_id == store.CLAUDE_AGENT else (conv.get("thread_id") or conv.get("fork_of"))
         if not has_context:
             instructions = self.ws.instructions_for(conv_id)
-        outgoing = f"{instructions}\n\n---\n\n{prompt}" if instructions else prompt
+        prompt_with_attachments = prompt + prepared["context"]
+        outgoing = (f"{instructions}\n\n---\n\n{prompt_with_attachments}"
+                    if instructions else prompt_with_attachments)
         # The file names come from the message metadata rather than being
         # baked into its text, so the transcript can show clickable previews.
         if instructions:
@@ -1343,13 +1377,14 @@ class TreeAgentApp:
                 session_id=conv.get("claude_session_id"), model=settings.get("model"),
                 executable=self.ws.agent_path(store.CLAUDE_AGENT),
                 permission_mode=settings.get("claude_permission"),
+                add_dirs=prepared["claude_dirs"],
             )
         else:
             turn = codex_runner.Turn(
                 prompt=outgoing, cwd=settings["cwd"], emit=emit,
                 thread_id=conv.get("thread_id"), model=settings.get("model"),
                 sandbox=settings.get("sandbox"), fork_from=conv.get("fork_of"),
-                images=images, review=review,
+                images=prepared["codex_images"], review=review,
                 executable=self.ws.agent_path(store.CODEX_AGENT),
             )
         self.turns[conv_id] = turn
@@ -1374,6 +1409,61 @@ class TreeAgentApp:
                 f"執行中（{AGENT_LABELS[agent_id]} · {mode}）· cwd={settings['cwd']}"
             )
         turn.start()
+
+    def _prepare_attachments(self, paths: list[str], *, page_limit: int = PDF_PAGE_LIMIT) -> dict[str, Any]:
+        """Turn PDF attachments into text plus page images for both CLIs."""
+        codex_images: list[str] = []
+        claude_dirs: list[str] = []
+        context: list[str] = []
+        errors: list[str] = []
+        for path in paths:
+            if not os.path.isfile(path):
+                errors.append(f"附件已不存在：{path}")
+                continue
+            suffix = os.path.splitext(path)[1].lower()
+            folder = os.path.dirname(os.path.abspath(path))
+            if folder not in claude_dirs:
+                claude_dirs.append(folder)
+            if suffix in _IMAGE_SUFFIXES:
+                codex_images.append(path)
+                context.append(f"\n\n附件圖片：{path}\n")
+                continue
+            if suffix != ".pdf":
+                errors.append(f"不支援的附件格式：{os.path.basename(path)}")
+                continue
+
+            # Keep rendered images in the workspace, rather than beside the
+            # user's source PDF, so they survive long enough for the CLI turn.
+            key = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:12]
+            output_dir = os.path.join(self.ws.home, "pdf-pages", key)
+            inspected = pdf_support.inspect_pdf(path, output_dir, page_limit=page_limit)
+            if not inspected.text and not inspected.rendered_images:
+                detail = "；".join(inspected.errors) or "無法讀取 PDF"
+                errors.append(f"{os.path.basename(path)}：{detail}")
+                continue
+            codex_images.extend(inspected.rendered_images)
+            if output_dir not in claude_dirs:
+                claude_dirs.append(output_dir)
+            page_note = (
+                f"\n\nPDF 附件：{path}\n"
+                f"共 {inspected.page_count} 頁；已處理前 {min(inspected.page_count, page_limit)} 頁。\n"
+            )
+            if inspected.text:
+                extracted = inspected.text[:PDF_TEXT_LIMIT]
+                if len(inspected.text) > PDF_TEXT_LIMIT:
+                    extracted += "\n[PDF 文字過長，已截斷]"
+                page_note += "擷取文字：\n" + extracted + "\n"
+            if inspected.rendered_images:
+                page_note += "頁面圖片：\n" + "\n".join(inspected.rendered_images) + "\n"
+            # Claude Code receives the text above and can use Read on these
+            # paths because their directories are supplied with --add-dir.
+            context.append(page_note)
+        return {
+            "codex_images": codex_images,
+            "claude_dirs": claude_dirs,
+            "context": "".join(context),
+            "errors": errors,
+        }
 
     def handle_slash_command(self, conv_id: str, command: str) -> None:
         """Handle the small set of app commands safe in non-interactive CLIs."""
@@ -1426,7 +1516,7 @@ class TreeAgentApp:
         if sum(1 for m in conv["messages"] if m["role"] == "user") > 1:
             return          # already had a first message; this is not it
         source = prompt
-        if prompt == IMAGE_ONLY_PROMPT and images:
+        if prompt in (IMAGE_ONLY_PROMPT, PDF_ONLY_PROMPT) and images:
             source = os.path.basename(images[0])
         title = store.title_from(source)
         if len(title.strip()) < 2:
@@ -1794,6 +1884,7 @@ class ConversationView(ttk.Frame):
         self.input.bind("<Return>", self._on_send_key)
         self.input.bind("<Shift-Return>", lambda e: None)  # let Text insert a newline
         self.input.bind("<KeyRelease>", lambda e: self._refresh_send_state())
+        self._register_file_drop()
 
         side = ttk.Frame(composer, style="TFrame")
         side.grid(row=0, column=1, sticky="ns", padx=(8, 0))
@@ -1801,10 +1892,10 @@ class ConversationView(ttk.Frame):
         self.send_button.pack(fill="x")
         self.stop_button = ttk.Button(side, text="停止", command=self.on_stop, width=12, state="disabled")
         self.stop_button.pack(fill="x", pady=(6, 0))
-        self.attach_button = ttk.Button(side, text="附加圖片", style="Toolbar.TButton",
+        self.attach_button = ttk.Button(side, text="附加檔案", style="Toolbar.TButton",
                                         command=self.attach_files, width=12)
         self.attach_button.pack(fill="x", pady=(6, 0))
-        _Tooltip(self.attach_button, "附加圖片給 Codex（也可以直接在輸入框按 Ctrl+V 貼上截圖）")
+        _Tooltip(self.attach_button, "附加圖片或 PDF（也可以直接在輸入框按 Ctrl+V 貼上截圖）")
 
         self._bind_transcript()  # needs self.input, so it runs last
         self._refresh_send_state()
@@ -2138,6 +2229,26 @@ class ConversationView(ttk.Frame):
     def current_attachments(self) -> list[str]:
         return self.attachments.setdefault(self.conv_id, []) if self.conv_id else []
 
+    def _register_file_drop(self) -> None:
+        """Accept PDF files dropped directly on the message input on Windows."""
+        root = self.winfo_toplevel()
+        if (DND_FILES is None or not hasattr(self.input, "drop_target_register")
+                or not hasattr(root, "TkdndVersion")):
+            return
+        self.input.drop_target_register(DND_FILES)
+        self.input.dnd_bind("<<Drop>>", self._on_file_drop)
+
+    def _on_file_drop(self, event) -> str:
+        """Attach dropped PDFs without inserting their paths into the message."""
+        paths = [os.path.abspath(path) for path in self.tk.splitlist(event.data)]
+        pdfs = [path for path in paths if path.lower().endswith(".pdf")]
+        if pdfs:
+            self.add_attachments(pdfs)
+        skipped = len(paths) - len(pdfs)
+        if skipped:
+            self.app.set_status("拖曳到輸入框僅支援 PDF 檔案")
+        return "break"
+
     def _on_paste(self, _event=None):
         """Ctrl+V: attach an image if there is one, otherwise paste text."""
         if not self.conv_id:
@@ -2151,8 +2262,13 @@ class ConversationView(ttk.Frame):
             return
         chosen = filedialog.askopenfilenames(
             parent=self,
-            title="附加圖片",
-            filetypes=[("圖片", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("所有檔案", "*.*")],
+            title="附加檔案",
+            filetypes=[
+                ("圖片或 PDF", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.pdf"),
+                ("PDF", "*.pdf"),
+                ("圖片", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"),
+                ("所有檔案", "*.*"),
+            ],
         )
         if chosen:
             self.add_attachments(list(chosen))
@@ -2168,7 +2284,7 @@ class ConversationView(ttk.Frame):
                 added += 1
         if added:
             self.refresh_attachments()
-            self.app.set_status(f"已附加 {added} 個圖片檔，送出時一併傳給 Codex")
+            self.app.set_status(f"已附加 {added} 個檔案，送出時一併交給 Agent")
 
     def remove_attachment(self, path: str) -> None:
         current = self.current_attachments()
@@ -2177,9 +2293,18 @@ class ConversationView(ttk.Frame):
             self.refresh_attachments()
 
     def _thumbnail(self, path: str) -> tk.PhotoImage | None:
-        """A small preview, for the formats Tk can decode itself (PNG / GIF)."""
+        """A small preview for image and PDF attachments when available."""
+        source = path
+        if path.lower().endswith(".pdf"):
+            key = hashlib.sha1(os.path.abspath(path).encode("utf-8")).hexdigest()[:12]
+            rendered = pdf_support.render_pdf_thumbnail(
+                path, os.path.join(self.app.ws.home, "pdf-thumbnails", key)
+            )
+            if not rendered.rendered_images:
+                return None
+            source = rendered.rendered_images[0]
         try:
-            image = tk.PhotoImage(master=self, file=path)
+            image = tk.PhotoImage(master=self, file=source)
         except tk.TclError:
             return None  # JPEG/WEBP: Tk cannot read these, show the name only
         factor = max(1, -(-image.height() // THUMBNAIL_HEIGHT))
@@ -2211,7 +2336,7 @@ class ConversationView(ttk.Frame):
                     side="left", padx=(3, 5), pady=3
                 )
             else:
-                tk.Label(inner, text="🖼", bg=COLORS["panel"],
+                tk.Label(inner, text="PDF" if path.lower().endswith(".pdf") else "🖼", bg=COLORS["panel"],
                          font=(self.app.ui_font, 14)).pack(side="left", padx=(6, 5), pady=3)
 
             name = os.path.basename(path)
@@ -2258,7 +2383,7 @@ class ConversationView(ttk.Frame):
                              command=lambda: self.input.event_generate("<<Paste>>"))
 
         menu.add_separator()
-        menu.add_command(label="附加圖片…", command=self.attach_files)
+        menu.add_command(label="附加檔案…", command=self.attach_files)
         menu.add_command(
             label="全選",
             command=lambda: self.input.tag_add("sel", "1.0", "end-1c"),
@@ -2488,6 +2613,7 @@ class ConversationView(ttk.Frame):
         # Also applied here, not just on ingest, so transcripts recorded before
         # the escape stripping existed still render cleanly.
         text = codex_runner.clean_output(text)
+        text = _file_citations_to_markdown(text)
         # Hidden tool calls never leave a visible marker in the transcript.
         if role in ("tool", "agent_tool"):
             return
@@ -2688,10 +2814,8 @@ class ConversationView(ttk.Frame):
         if not prompt and not images:
             return
         if not prompt:
-            prompt = IMAGE_ONLY_PROMPT
-        if images and self.app.ws.conversation_agent(self.conv_id) == store.CLAUDE_AGENT:
-            self.app.set_status("Claude Code 的第一版尚不支援圖片附件，請移除附件後再送出。")
-            return
+            prompt = (PDF_ONLY_PROMPT if any(path.lower().endswith(".pdf") for path in images)
+                      else IMAGE_ONLY_PROMPT)
         if self.conv_id in self.app.turns:
             self.queued.setdefault(self.conv_id, []).append((prompt, images))
             self.input.delete("1.0", "end")
@@ -3120,7 +3244,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     _enable_dpi_awareness()
-    root = tk.Tk()
+    root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
     TreeAgentApp(root, home=args.home)
     root.mainloop()
 

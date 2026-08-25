@@ -35,6 +35,10 @@ assert "--dangerously-skip-permissions" in bypass.build_command()
 assert "--dangerously-skip-permissions" not in turn.build_command()
 print("Claude bypass permission is passed to non-interactive CLI OK")
 
+with_dir = cr.ClaudeTurn("hi", ".", events.append, add_dirs=[tempfile.gettempdir()])
+assert "--add-dir" in with_dir.build_command()
+print("Claude receives attachment directories through --add-dir OK")
+
 root = tk.Tk()
 app = TreeAgentApp(root, home=tempfile.mkdtemp(), single_instance=False)
 node = app.ws.projects[0]["children"][0]

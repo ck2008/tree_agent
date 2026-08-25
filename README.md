@@ -24,7 +24,7 @@ Codex 的專案列表是平面的：每個專案只是一個資料夾，對話�
 ## 需求
 
 - Windows 10 / 11
-- Python 3.10+（用內建的 Tkinter，**不需要安裝任何套件**）
+- Python 3.10+（用內建的 Tkinter；若要處理 PDF，另見下方）
 - Codex CLI 已安裝並在 PATH 中：`npm install -g @openai/codex`，且已 `codex login`
   （對著 **0.149.0** 驗證過；0.147.0 也可用 — 用到的 CLI 介面兩版相同）
 
@@ -41,6 +41,16 @@ python -m tree_agent
 ```bash
 python -m tree_agent --home D:\my-other-workspace
 ```
+
+### PDF 附件
+
+要讓 Codex CLI 與 Claude Code 都能讀取、預覽及分析 PDF，先安裝一次 PDF 支援：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+對話輸入區按「附加檔案」或直接把 PDF 拖進輸入框即可加入附件。送出時可選擇要處理的頁數（預設 20 頁）；Tree Agent 會抽取文字並渲染頁面 PNG：Codex CLI 直接接收頁面圖片；Claude Code 會取得文字與可讀取頁面檔案的目錄。PDF 附件與 Agent 產生的 PDF 都會顯示可開啟的檔案連結。
 
 ## 操作
 

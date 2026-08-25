@@ -1,0 +1,3 @@
+# PDF reading, page previews, and PDF drag-and-drop in the input box.
+PyMuPDF>=1.24
+tkinterdnd2>=0.4
