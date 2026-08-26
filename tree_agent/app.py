@@ -76,36 +76,52 @@ LIGHT_COLORS = {
 }
 
 DARK_COLORS = {
-    # VS Code Dark+ surface and semantic colours.
-    "bg": "#1e1e1e",
-    "panel": "#1e1e1e",
-    "border": "#3c3c3c",
-    "text": "#d4d4d4",
-    "muted": "#9d9d9d",
+    # Warm neutral surfaces with an off-white body text, rather than the cool
+    # near-black and dim grey of Dark+.  Pure-grey darks read as a switched-off
+    # screen next to the warm light theme, and #d4d4d4 body text on #1e1e1e is
+    # dimmer than it needs to be for long transcripts.  Only the neutrals moved;
+    # the semantic accents (你 / 錯誤 / 提示 / 選取) are unchanged.
+    #
+    # The chrome is deliberately *flat*: the rail, the menu bar, the explorer
+    # and the transcript are all one colour, and only a raised card (`tool_bg`,
+    # `user_bg`) lifts off it.  Dark+ layers them the other way round -- an
+    # explorer lighter than the editor -- which reads as a stack of panels
+    # rather than one surface.
+    #
+    # A consequence worth knowing: `_replace_widget_colors` repaints live
+    # widgets by mapping old-palette-value -> new-palette-value, so the roles
+    # sharing one value here cannot be told apart on a theme switch (for a
+    # duplicate, the last key wins).  Every surface that needs a role the
+    # mapping cannot infer is repainted by name at the end of `apply_theme`.
+    "bg": "#262624",
+    "panel": "#262624",
+    "border": "#3b3a36",
+    "text": "#e8e6e1",
+    "muted": "#a3a09a",
     "user": "#4daafc",
-    "agent": "#d4d4d4",
-    "reasoning": "#9d9d9d",
-    "tool": "#cccccc",
-    "tool_bg": "#252526",
+    "agent": "#e8e6e1",
+    "reasoning": "#a3a09a",
+    "tool": "#d5d2cc",
+    "tool_bg": "#2f2e2c",
     "error": "#f14c4c",
     "notice": "#cca700",
     "accent": "#3794ff",
-    "user_bg": "#2a2d2e",
-    "warn_bg": "#332f16",
+    "user_bg": "#363431",
+    "warn_bg": "#383018",
     "select": "#094771",
-    "select_idle": "#37373d",
-    "tree_conversation": "#cccccc",
+    "select_idle": "#3f3d39",
+    "tree_conversation": "#d5d2cc",
     "drop_target": "#007fd4",
-    "log": "#9d9d9d",
-    "tooltip": "#111827",
-    "activity": "#181818",
-    "sidebar": "#252526",
-    "editor": "#1e1e1e",
-    "toolbar": "#181818",
-    "input": "#3c3c3c",
-    "hover": "#2a2d2e",
-    "button": "#3c3c3c",
-    "button_hover": "#505050",
+    "log": "#a3a09a",
+    "tooltip": "#141312",
+    "activity": "#262624",
+    "sidebar": "#262624",
+    "editor": "#262624",
+    "toolbar": "#262624",
+    "input": "#3b3a36",
+    "hover": "#363431",
+    "button": "#3b3a36",
+    "button_hover": "#4a4843",
     "primary": "#0e639c",
     "primary_hover": "#1177bb",
     "focus": "#007fd4",
@@ -176,6 +192,9 @@ OUTLINE_WIDTH = 250           # starting width; drag the sash to change it
 INFO_WIDTH = 290
 MIN_CONTENT_PX = 560
 MIN_PROJECT_PANE_PX = 220
+BUBBLE_MAX_RATIO = 0.72       # your own message never spans the whole measure
+BLOCK_PADX_PX = 12            # window_create padding either side of a card
+BLOCK_RMARGIN_PX = 14         # matches the `user` tag, so both edges line up
 MIN_RAIL_PX = 120             # a rail narrower than this is not worth keeping
 TEXT_INSET_PX = 14            # the transcript's own breathing room
 # A turn routinely runs for tens of seconds, so show what it is doing.
@@ -1147,6 +1166,26 @@ class TreeAgentApp:
         self.tree.tag_configure("running", foreground=COLORS["accent"])
         self.tree.tag_configure("droptarget", background=COLORS["drop_target"])
         self.conv_view._configure_tags()
+        self.conv_view.recolor_bubbles()
+        # The flat dark chrome gives the rail, the menu bar, the explorer and
+        # the transcript one shared value, so the value-for-value mapping cannot
+        # tell which role each of them meant. Name them.
+        self.custom_menu_bar.configure(bg=COLORS["toolbar"])
+        for button in self.custom_menu_buttons:
+            button.configure(bg=COLORS["toolbar"], fg=COLORS["text"],
+                             activebackground=COLORS["hover"], activeforeground=COLORS["text"])
+        self.activity_rail.configure(bg=COLORS["activity"])
+        self.activity_button.configure(bg=COLORS["activity"], fg=COLORS["accent"],
+                                       activebackground=COLORS["hover"],
+                                       activeforeground=COLORS["accent"])
+        # Both rails are built from labels whose colours are picked at build
+        # time; rebuilding them is cheaper to keep right than mapping each one.
+        # `None` until the first layout pass decides which rails fit.
+        outline, info = self.conv_view._panels_shown or (False, False)
+        if outline:
+            self.conv_view.refresh_outline()
+        if info:
+            self.conv_view.refresh_info()
         self.ws.data.setdefault("ui", {})["theme"] = self.theme
         self.ws.touch()
         self.set_status("已切換為" + ("深色模式" if self.theme == THEME_DARK else "淺色模式"))
@@ -1873,7 +1912,7 @@ class ConversationView(ttk.Frame):
         )
         self._vsb = vsb
         self.text.configure(yscrollcommand=self._on_scroll)
-        self.text.bind("<Configure>", self._resize_user_logs, add="+")
+        self.text.bind("<Configure>", self._resize_inline_blocks, add="+")
         self.text.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
         vsb.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
         self._build_outline()
@@ -2092,11 +2131,10 @@ class ConversationView(ttk.Frame):
             line, _, char = index.partition(".")
             return int(line), int(char)
 
-        ranges = self.text.tag_ranges("role_user")
-        for i in range(0, len(ranges), 2):
-            end = str(ranges[i + 1])
-            label = self.text.get(end, f"{end} lineend").strip()
-            found.append((key(end), label or "（訊息）", 0, end))
+        # Your turns are embedded bubbles now, so their headings are recorded as
+        # they are drawn rather than read back out of the widget.
+        for index, label in getattr(self, "_user_entries", ()):
+            found.append((key(index), label or "（訊息）", 0, index))
 
         for level, tag in ((1, "md_h1"), (2, "md_h2"), (3, "md_h3")):
             ranges = self.text.tag_ranges(tag)
@@ -2489,10 +2527,6 @@ class ConversationView(ttk.Frame):
     def _configure_tags(self) -> None:
         app = self.app
         self.text.tag_configure(
-            "role_user", foreground=COLORS["user"], font=(app.ui_font, 10, "bold"),
-            spacing1=12, justify="right", rmargin=14,
-        )
-        self.text.tag_configure(
             "role_user_log", foreground=COLORS["user"], font=(app.ui_font, 10, "bold"),
             spacing1=12, justify="left", lmargin1=12, lmargin2=12,
         )
@@ -2508,6 +2542,15 @@ class ConversationView(ttk.Frame):
         self.text.tag_configure(
             "user", foreground=COLORS["user"], justify="right",
             lmargin1=90, lmargin2=90, rmargin=14, spacing1=1, spacing3=3,
+        )
+        # Your message is drawn as an embedded bubble, which holds no transcript
+        # text of its own. The words are inserted here as well and elided, the
+        # same trick collapsed tool output uses, so Ctrl+A, Ctrl+C and search
+        # still reach them. Justification matches `user`: an elided run shares a
+        # display line with the bubble that follows it.
+        self.text.tag_configure(
+            "user_hidden", elide=True, justify="right", lmargin1=90, lmargin2=90,
+            rmargin=14,
         )
         self.text.tag_configure(
             "user_log", foreground=COLORS["tool"], font=(app.mono_font, 9),
@@ -2542,6 +2585,8 @@ class ConversationView(ttk.Frame):
         self._inline_log_widgets: list[tk.Frame] = []
         self._inline_code_widgets: list[tk.Frame] = []
         self._inline_code_labels: list[tk.Label] = []
+        self._inline_bubbles: list[tk.Label] = []
+        self._user_entries: list[tuple[str, str]] = []
         self._link_targets: dict[str, str] = {}
         self._tool_blocks: list[tuple[str, str, str]] = []
         self._shown_agent_labels = set()
@@ -2557,7 +2602,7 @@ class ConversationView(ttk.Frame):
         for message in conv["messages"]:
             self._write(message["role"], message["text"], message.get("images"),
                         message.get("agent_id"))
-        self._resize_user_logs()
+        self._resize_inline_blocks()
         self.text.configure(state="disabled")
         self.text.see("end")
         self.apply_panels()
@@ -2668,7 +2713,7 @@ class ConversationView(ttk.Frame):
         user_log = role == "user" and _is_terminal_log(text)
         role_tag = (
             "role_user_log" if user_log
-            else {"user": "role_user", "agent": "role_agent"}.get(role, "role_other")
+            else "role_agent" if role == "agent" else "role_other"
         )
         body_tag = (
             "user_log" if user_log else role
@@ -2677,23 +2722,105 @@ class ConversationView(ttk.Frame):
         )
         if user_log:
             self.text.insert("end", "你（貼上的日誌）\n", role_tag)
+            self._write_user_log(text)
+        elif role == "user":
+            # No "你" label above your own messages: the right-aligned bubble
+            # already says whose turn it is, so the label was only a line of
+            # noise repeated down the whole transcript.
+            if text:
+                self._write_user_bubble(text.rstrip())
         elif role == "agent":
             label = AGENT_LABELS.get(agent_id or self.app.ws.conversation_agent(self.conv_id or ""))
             if label not in self._shown_agent_labels:
                 self.text.insert("end", label + "\n", role_tag)
                 self._shown_agent_labels.add(label)
-        elif role != "meta":
-            self.text.insert("end", ROLE_LABELS.get(role, role) + "\n", role_tag)
-        if user_log:
-            self._write_user_log(text)
-        elif role == "agent":
             # Only the agent's prose is Markdown; command output and the user's
             # own text are shown exactly as written.
             self._write_agent_markdown(text.strip(), body_tag)
-        elif text:
-            self.text.insert("end", text.rstrip() + "\n", body_tag)
+        else:
+            if role != "meta":
+                self.text.insert("end", ROLE_LABELS.get(role, role) + "\n", role_tag)
+            if text:
+                self.text.insert("end", text.rstrip() + "\n", body_tag)
         for path in images or ():
             self._write_attachment(path, body_tag)
+
+    def _write_user_bubble(self, text: str) -> None:
+        """Draw your own message as a right-aligned tinted bubble.
+
+        A tag background is painted across the whole display line rather than
+        behind the glyphs, so tinting the `user` tag gave a full-width band and
+        the transcript settled for alignment alone.  An embedded widget is sized
+        by its own content, which is what finally makes a bubble possible.  It
+        sits on a line carrying the right-justifying `user` tag, so the bubble
+        hugs the right edge while the gutter beside it stays ordinary transcript
+        that still takes a click.
+        """
+        bubble = tk.Frame(self.text, bg=COLORS["user_bg"], bd=0, highlightthickness=0)
+        body = tk.Label(
+            bubble, text=text, bg=COLORS["user_bg"], fg=COLORS["text"],
+            font=(self.app.ui_font, 10), justify="left", anchor="w",
+            padx=12, pady=8, wraplength=self._bubble_wraplength(),
+        )
+        body.pack(fill="both", expand=True)
+        # A Label is not selectable, so the message stays reachable by menu.
+        for widget in (bubble, body):
+            widget.bind("<Button-3>", lambda event, value=text: self._bubble_menu(event, value))
+        self._bind_block_mousewheel(bubble)
+        self._inline_bubbles.append(body)
+        start = self.text.index("end-1c")
+        # Elided first, then the bubble: the transcript must not *end* on elided
+        # text, because `following_tail()` asks the widget whether the last
+        # character is on screen and an elided one never is.
+        self.text.insert("end", text + "\n", "user_hidden")
+        window_at = self.text.index("end-1c")
+        self.text.window_create("end", window=bubble, padx=0, pady=3, align="top")
+        self.text.insert("end", "\n", "user")
+        self.text.tag_add("user", window_at, f"{window_at}+1c")
+        # The outline is read back off the widget and an embedded window has no
+        # text to read, so remember what this bubble stands for.
+        first_line = text.strip().splitlines()[0].strip() if text.strip() else ""
+        self._user_entries.append((start, first_line))
+
+    def recolor_bubbles(self) -> None:
+        """Re-tint the bubbles already on screen after a theme change.
+
+        `user_bg` shares its light value with `hover` and `button_hover`, so the
+        value-for-value palette swap cannot tell which role a bubble meant and
+        picks the wrong Dark+ layer. Setting it from the palette is exact.
+        """
+        for label in getattr(self, "_inline_bubbles", ()):
+            if label.winfo_exists():
+                label.configure(bg=COLORS["user_bg"], fg=COLORS["text"])
+                parent = label.master
+                if parent.winfo_exists():
+                    parent.configure(bg=COLORS["user_bg"])
+
+    def _content_px(self) -> int:
+        """The readable measure: what is left between the transcript's insets.
+
+        `winfo_width()` is the whole widget; the cap is applied as `padx`, so the
+        inset has to come off both sides. Every embedded block is measured
+        against this, otherwise they disagree about where the right edge is —
+        a card sized to the *pane* overshoots the measure on a wide window and
+        is clipped, while the bubbles stop at the measure and look misplaced.
+        """
+        width = self.text.winfo_width() - 2 * int(self.text.cget("padx"))
+        return width if width > 240 else MAX_CONTENT_PX
+
+    def _bubble_wraplength(self) -> int:
+        """Pixels a bubble may fill before wrapping — never the whole measure."""
+        return max(200, int(self._content_px() * BUBBLE_MAX_RATIO))
+
+    def _bubble_menu(self, event, text: str) -> None:
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="複製這則訊息", command=lambda: self._copy_block(text))
+        menu.add_separator()
+        menu.add_command(label="複製整段對話", command=self.app.copy_transcript)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
     def _write_user_log(self, text: str) -> None:
         """Embed a read-only, horizontally scrollable terminal-output block."""
@@ -2753,8 +2880,8 @@ class ConversationView(ttk.Frame):
             + horizontal.winfo_reqheight() + 3
         )
         collection.append(frame)
-        self.text.window_create("end", window=frame, padx=12, pady=4, align="top")
-        self._resize_user_logs()
+        self.text.window_create("end", window=frame, padx=BLOCK_PADX_PX, pady=4, align="top")
+        self._resize_inline_blocks()
         self.text.insert("end", "\n", "user_log")
 
     def _write_code_card(self, content: str) -> None:
@@ -2782,8 +2909,8 @@ class ConversationView(ttk.Frame):
         self._inline_code_widgets.append(frame)
         self._inline_code_labels.append(code)
         self._bind_block_mousewheel(frame)
-        self.text.window_create("end", window=frame, padx=12, pady=4, align="top")
-        self._resize_user_logs()
+        self.text.window_create("end", window=frame, padx=BLOCK_PADX_PX, pady=4, align="top")
+        self._resize_inline_blocks()
         self.text.insert("end", "\n", "agent")
 
     def _copy_block(self, content: str) -> None:
@@ -2812,13 +2939,16 @@ class ConversationView(ttk.Frame):
         self._update_jump_button()
         return "break"
 
-    def _resize_user_logs(self, _event=None) -> None:
-        """Make each embedded log block use the available transcript width."""
-        # The body is stable; the Text widget's requested width can temporarily
-        # grow to fit an embedded card while a transcript is being rebuilt.
-        # Request the complete pane width so a card always reaches the visible
-        # right edge instead of shrinking to the length of its code.
-        width = max(320, self.body.winfo_width() + 12)
+    def _resize_inline_blocks(self, _event=None) -> None:
+        """Re-measure every embedded block against the transcript's width."""
+        wraplength = self._bubble_wraplength()
+        for label in getattr(self, "_inline_bubbles", ()):
+            if label.winfo_exists():
+                label.configure(wraplength=wraplength)
+        # Fill the measure rather than shrink-wrapping the code, but stop at the
+        # measure: sized to the pane instead, a card ran past the right inset on
+        # a wide window and was clipped there.
+        width = max(320, self._content_px() - BLOCK_PADX_PX - BLOCK_RMARGIN_PX)
         for frame in getattr(self, "_inline_log_widgets", ()):
             if frame.winfo_exists():
                 frame.configure(width=width)
