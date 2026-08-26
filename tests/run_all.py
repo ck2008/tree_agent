@@ -19,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SUITES = [
     "test_core",
     "test_richtext",
+    "test_user_logs",
     "test_defaults",
     "test_prompt",
     "test_create",

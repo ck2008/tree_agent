@@ -143,6 +143,15 @@ PDF_ONLY_PROMPT = "請分析附加的 PDF。"
 PDF_PAGE_LIMIT = 20
 PDF_TEXT_LIMIT = 60_000
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+_TERMINAL_LOG_LINE = re.compile(
+    r"^\s*(?:at\s+|Error\b|Traceback\b|Caused by:|npm WARN\b|file:|"
+    r"[A-Za-z_][\w.]*?(?:Error|Exception):)|\b(?:EACCES|EBADENGINE|"
+    r"node:internal/)\b",
+    re.MULTILINE,
+)
+_FENCED_CODE_BLOCK = re.compile(
+    r"(?ms)^[ \t]*(```|~~~)[^\r\n]*\r?\n(.*?)^[ \t]*\1[ \t]*$"
+)
 
 # How much of a command execution to draw. Codex can emit hundreds of lines of
 # `git status` or a file listing, which buries the answer it was working towards.
@@ -166,6 +175,7 @@ MAX_CONTENT_PX = 980
 OUTLINE_WIDTH = 250           # starting width; drag the sash to change it
 INFO_WIDTH = 290
 MIN_CONTENT_PX = 560
+MIN_PROJECT_PANE_PX = 220
 MIN_RAIL_PX = 120             # a rail narrower than this is not worth keeping
 TEXT_INSET_PX = 14            # the transcript's own breathing room
 # A turn routinely runs for tens of seconds, so show what it is doing.
@@ -494,9 +504,13 @@ class TreeAgentApp:
         self._build_detail_pane()
 
         ui = self.ws.data.get("ui") or {}
-        # Deferred so the panes have a size to divide. Tracked because closing
-        # the window sooner than this would fire it against a dead interpreter.
-        self._sash_job = self.root.after(80, lambda: self._set_sash(ui.get("sash", 300)))
+        # Restore only after the pane has a real width.  A fixed timer races
+        # with Windows' first layout pass and can leave the project explorer
+        # collapsed at x=0 on startup.
+        self._startup_sash = int(ui.get("sash", 300))
+        self._startup_sash_restored = False
+        self.paned.bind("<Configure>", self._restore_startup_sash, add="+")
+        self._sash_job = self.root.after_idle(self._restore_startup_sash)
 
         self.status = ttk.Label(outer, text="", style="Muted.TLabel", anchor="w")
         # The main paned window was packed to the left while this label used
@@ -521,9 +535,26 @@ class TreeAgentApp:
 
     def _set_sash(self, position: int) -> None:
         try:
-            self.paned.sashpos(0, int(position))
+            width = self.paned.winfo_width()
+            if width < 1:
+                return
+            # Never restore a collapsed project pane.  Older versions could
+            # persist a zero sash while the window was closing, making the
+            # explorer appear to vanish on the next launch.
+            maximum = max(0, width - MIN_CONTENT_PX)
+            minimum = min(MIN_PROJECT_PANE_PX, maximum)
+            self.paned.sashpos(0, max(minimum, min(int(position), maximum)))
         except tk.TclError:
             pass
+
+    def _restore_startup_sash(self, _event=None) -> None:
+        """Apply the saved main-sash position once the paned window is ready."""
+        if self._startup_sash_restored:
+            return
+        if self.paned.winfo_width() < MIN_PROJECT_PANE_PX + MIN_CONTENT_PX:
+            return
+        self._set_sash(self._startup_sash)
+        self._startup_sash_restored = True
 
     def _build_tree_pane(self) -> None:
         left = ttk.Frame(self.paned, style="Sidebar.TFrame")
@@ -1711,7 +1742,7 @@ class TreeAgentApp:
         ui["outline_width"] = self.outline_width
         ui["info_width"] = self.info_width
         try:
-            ui["sash"] = self.paned.sashpos(0)
+            ui["sash"] = max(MIN_PROJECT_PANE_PX, self.paned.sashpos(0))
         except tk.TclError:
             pass
         try:
@@ -1842,6 +1873,7 @@ class ConversationView(ttk.Frame):
         )
         self._vsb = vsb
         self.text.configure(yscrollcommand=self._on_scroll)
+        self.text.bind("<Configure>", self._resize_user_logs, add="+")
         self.text.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
         vsb.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
         self._build_outline()
@@ -2461,6 +2493,10 @@ class ConversationView(ttk.Frame):
             spacing1=12, justify="right", rmargin=14,
         )
         self.text.tag_configure(
+            "role_user_log", foreground=COLORS["user"], font=(app.ui_font, 10, "bold"),
+            spacing1=12, justify="left", lmargin1=12, lmargin2=12,
+        )
+        self.text.tag_configure(
             "role_agent", foreground=COLORS["agent"], font=(app.ui_font, 10, "bold"), spacing1=10
         )
         self.text.tag_configure(
@@ -2472,6 +2508,10 @@ class ConversationView(ttk.Frame):
         self.text.tag_configure(
             "user", foreground=COLORS["user"], justify="right",
             lmargin1=90, lmargin2=90, rmargin=14, spacing1=1, spacing3=3,
+        )
+        self.text.tag_configure(
+            "user_log", foreground=COLORS["tool"], font=(app.mono_font, 9),
+            justify="left", lmargin1=12, lmargin2=12, rmargin=12,
         )
         self.text.tag_configure("agent", foreground=COLORS["agent"], lmargin1=12, lmargin2=12)
         self.text.tag_configure(
@@ -2499,6 +2539,9 @@ class ConversationView(ttk.Frame):
             self._stash_draft()
         # Embedded previews are re-created from scratch for the new transcript.
         self._inline_images: list[tk.PhotoImage] = []
+        self._inline_log_widgets: list[tk.Frame] = []
+        self._inline_code_widgets: list[tk.Frame] = []
+        self._inline_code_labels: list[tk.Label] = []
         self._link_targets: dict[str, str] = {}
         self._tool_blocks: list[tuple[str, str, str]] = []
         self._shown_agent_labels = set()
@@ -2514,6 +2557,7 @@ class ConversationView(ttk.Frame):
         for message in conv["messages"]:
             self._write(message["role"], message["text"], message.get("images"),
                         message.get("agent_id"))
+        self._resize_user_logs()
         self.text.configure(state="disabled")
         self.text.see("end")
         self.apply_panels()
@@ -2621,27 +2665,174 @@ class ConversationView(ttk.Frame):
             # Older transcripts baked the file names into the message text;
             # they are drawn from `images` now, so drop the duplicated lines.
             text = _ATTACHMENT_LINE.sub("", text).rstrip()
-        role_tag = {"user": "role_user", "agent": "role_agent"}.get(role, "role_other")
+        user_log = role == "user" and _is_terminal_log(text)
+        role_tag = (
+            "role_user_log" if user_log
+            else {"user": "role_user", "agent": "role_agent"}.get(role, "role_other")
+        )
         body_tag = (
-            role
+            "user_log" if user_log else role
             if role in ("user", "agent", "reasoning", "tool", "error", "notice", "meta")
             else "agent"
         )
-        if role == "agent":
+        if user_log:
+            self.text.insert("end", "你（貼上的日誌）\n", role_tag)
+        elif role == "agent":
             label = AGENT_LABELS.get(agent_id or self.app.ws.conversation_agent(self.conv_id or ""))
             if label not in self._shown_agent_labels:
                 self.text.insert("end", label + "\n", role_tag)
                 self._shown_agent_labels.add(label)
         elif role != "meta":
             self.text.insert("end", ROLE_LABELS.get(role, role) + "\n", role_tag)
-        if role == "agent":
+        if user_log:
+            self._write_user_log(text)
+        elif role == "agent":
             # Only the agent's prose is Markdown; command output and the user's
             # own text are shown exactly as written.
-            richtext.insert(self.text, text.strip(), (body_tag,))
+            self._write_agent_markdown(text.strip(), body_tag)
         elif text:
             self.text.insert("end", text.rstrip() + "\n", body_tag)
         for path in images or ():
             self._write_attachment(path, body_tag)
+
+    def _write_user_log(self, text: str) -> None:
+        """Embed a read-only, horizontally scrollable terminal-output block."""
+        self._write_scrollable_block(text.rstrip("\n"), "日誌", self._inline_log_widgets)
+
+    def _write_agent_markdown(self, markdown: str, body_tag: str) -> None:
+        """Render prose as Markdown, but give fenced code its own copy control."""
+        position = 0
+        for match in _FENCED_CODE_BLOCK.finditer(markdown):
+            prose = markdown[position:match.start()].strip()
+            if prose:
+                richtext.insert(self.text, prose, (body_tag,))
+            self._write_code_card(match.group(2).rstrip("\n"))
+            position = match.end()
+        tail = markdown[position:].strip()
+        if tail:
+            richtext.insert(self.text, tail, (body_tag,))
+
+    def _write_scrollable_block(
+        self, content: str, label: str, collection: list[tk.Frame]
+    ) -> None:
+        """Embed monospaced content with independent scrollbars and a copy button."""
+        line_count = max(1, content.count("\n") + 1)
+        frame = tk.Frame(self.text, bg=COLORS["border"], bd=0, highlightthickness=0)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        header = tk.Frame(frame, bg=COLORS["tool_bg"], bd=0, highlightthickness=0)
+        tk.Label(
+            header, text=label, bg=COLORS["tool_bg"], fg=COLORS["muted"],
+            font=(self.app.ui_font, 8), anchor="w", padx=8,
+        ).grid(row=0, column=0, sticky="w")
+        tk.Button(
+            header, text="複製", command=lambda value=content: self._copy_block(value),
+            bg=COLORS["primary"], fg="white", activebackground=COLORS["primary_hover"],
+            activeforeground="white", bd=0, padx=8, pady=1,
+            font=(self.app.ui_font, 8), cursor="hand2",
+        ).grid(row=0, column=1, padx=(0, 3), pady=2, sticky="w")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=1, pady=(1, 0))
+        log = tk.Text(
+            frame, width=96, height=min(12, max(4, line_count)), wrap="none", bd=0,
+            padx=8, pady=6, bg=COLORS["tool_bg"], fg=COLORS["tool"],
+            insertbackground=COLORS["tool"], font=(self.app.mono_font, 9),
+            selectbackground=COLORS["select"], selectforeground=COLORS["text"],
+        )
+        vertical = ttk.Scrollbar(frame, orient="vertical", command=log.yview,
+                                 style="VS.Vertical.TScrollbar")
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=log.xview)
+        log.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        log.grid(row=1, column=0, sticky="nsew", padx=1)
+        vertical.grid(row=1, column=1, sticky="ns")
+        horizontal.grid(row=2, column=0, sticky="ew", padx=1, pady=(0, 1))
+        log.insert("1.0", content)
+        log.configure(state="disabled")
+        frame.grid_propagate(False)
+        frame.configure(
+            height=header.winfo_reqheight() + log.winfo_reqheight()
+            + horizontal.winfo_reqheight() + 3
+        )
+        collection.append(frame)
+        self.text.window_create("end", window=frame, padx=12, pady=4, align="top")
+        self._resize_user_logs()
+        self.text.insert("end", "\n", "user_log")
+
+    def _write_code_card(self, content: str) -> None:
+        """Embed a wrapping, no-scrollbar code card with a copy action."""
+        frame = tk.Frame(self.text, bg=COLORS["border"], bd=0, highlightthickness=0)
+        frame.columnconfigure(0, weight=1)
+        header = tk.Frame(frame, bg=COLORS["tool_bg"], bd=0, highlightthickness=0)
+        tk.Label(
+            header, text="程式碼", bg=COLORS["tool_bg"], fg=COLORS["muted"],
+            font=(self.app.ui_font, 8), anchor="w", padx=8,
+        ).grid(row=0, column=0, sticky="w")
+        tk.Button(
+            header, text="複製", command=lambda value=content: self._copy_block(value),
+            bg=COLORS["primary"], fg="white", activebackground=COLORS["primary_hover"],
+            activeforeground="white", bd=0, padx=8, pady=1,
+            font=(self.app.ui_font, 8), cursor="hand2",
+        ).grid(row=0, column=1, padx=(0, 3), pady=2, sticky="w")
+        header.grid(row=0, column=0, sticky="ew", padx=1, pady=(1, 0))
+        code = tk.Label(
+            frame, text=content, bg=COLORS["tool_bg"], fg=COLORS["tool"],
+            font=(self.app.mono_font, 9), justify="left", anchor="nw", padx=8, pady=7,
+        )
+        code.grid(row=1, column=0, sticky="ew", padx=1, pady=(0, 1))
+        frame.grid_propagate(False)
+        self._inline_code_widgets.append(frame)
+        self._inline_code_labels.append(code)
+        self._bind_block_mousewheel(frame)
+        self.text.window_create("end", window=frame, padx=12, pady=4, align="top")
+        self._resize_user_logs()
+        self.text.insert("end", "\n", "agent")
+
+    def _copy_block(self, content: str) -> None:
+        self.clipboard_clear()
+        self.clipboard_append(content)
+        self.update()
+        self.app.set_status("已複製區塊內容")
+
+    def _bind_block_mousewheel(self, widget: tk.Misc) -> None:
+        """Let a code card pass wheel input through to the transcript."""
+        widget.bind("<MouseWheel>", self._scroll_transcript_from_block, add="+")
+        widget.bind("<Button-4>", lambda _event: self._scroll_transcript_units(-1), add="+")
+        widget.bind("<Button-5>", lambda _event: self._scroll_transcript_units(1), add="+")
+        for child in widget.winfo_children():
+            self._bind_block_mousewheel(child)
+
+    def _scroll_transcript_from_block(self, event) -> str:
+        delta = getattr(event, "delta", 0)
+        if delta:
+            units = -max(1, abs(delta) // 120) if delta > 0 else max(1, abs(delta) // 120)
+            self._scroll_transcript_units(units)
+        return "break"
+
+    def _scroll_transcript_units(self, units: int) -> str:
+        self.text.yview_scroll(units, "units")
+        self._update_jump_button()
+        return "break"
+
+    def _resize_user_logs(self, _event=None) -> None:
+        """Make each embedded log block use the available transcript width."""
+        # The body is stable; the Text widget's requested width can temporarily
+        # grow to fit an embedded card while a transcript is being rebuilt.
+        # Request the complete pane width so a card always reaches the visible
+        # right edge instead of shrinking to the length of its code.
+        width = max(320, self.body.winfo_width() + 12)
+        for frame in getattr(self, "_inline_log_widgets", ()):
+            if frame.winfo_exists():
+                frame.configure(width=width)
+        for frame, code in zip(
+            getattr(self, "_inline_code_widgets", ()),
+            getattr(self, "_inline_code_labels", ()),
+        ):
+            if not frame.winfo_exists():
+                continue
+            frame.configure(width=width)
+            code.configure(wraplength=max(200, width - 18))
+            frame.update_idletasks()
+            header = frame.winfo_children()[0]
+            frame.configure(height=header.winfo_reqheight() + code.winfo_reqheight() + 2)
 
     def _write_tool(self, text: str, body_tag: str) -> None:
         """Tool calls belong to the right-side audit log, never the answer."""
@@ -3230,6 +3421,11 @@ def _open_in_explorer(path: str) -> None:
         os.startfile(path)  # noqa: S606 - user-initiated
     else:
         subprocess.Popen(["xdg-open", path])
+
+
+def _is_terminal_log(text: str) -> bool:
+    """Whether a pasted user message looks like multi-line terminal output."""
+    return text.count("\n") >= 2 and bool(_TERMINAL_LOG_LINE.search(text))
 
 
 def main(argv: list[str] | None = None) -> None:

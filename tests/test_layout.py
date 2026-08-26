@@ -10,6 +10,13 @@ root = tk.Tk()
 app = TreeAgentApp(root, home=home)
 root.update()
 
+# A collapsed sash saved by an older version must not hide the project tree on
+# the next launch.
+app._set_sash(0)
+root.update_idletasks(); root.update()
+assert app.paned.sashpos(0) >= 220, app.paned.sashpos(0)
+print("saved collapsed project pane is restored to a visible width OK")
+
 # ---- toolbar reads left-to-right ----
 bar = app.tree.master.master.winfo_children()[0]
 buttons = [w for w in bar.winfo_children() if isinstance(w, tk.ttk.Button)]
