@@ -32,13 +32,399 @@ except ImportError:  # Keep the main UI usable if optional drag support is absen
 if __package__ in (None, ""):  # allow `python app.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from tree_agent import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
+    from tree_agent.client_api import ApiError, RemoteWorkspace, WorkspaceClient
+    from tree_agent.session_store import SessionStore
 else:
     from . import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
+    from .client_api import ApiError, RemoteWorkspace, WorkspaceClient
+    from .session_store import SessionStore
 
 APP_NAME = "Tree Agent"
 
 UI_FONT = "Microsoft JhengHei UI"
 MONO_FONT = "Consolas"
+
+
+class PasswordResetDialog(tk.Toplevel):
+    """Two-stage password reset UI; the code is sent only by the local service."""
+
+    def __init__(self, parent: tk.Misc, client: WorkspaceClient) -> None:
+        super().__init__(parent)
+        self.client = client
+        self.title(f"{APP_NAME} — 忘記密碼")
+        self.resizable(False, False)
+        # The root is withdrawn while authentication runs. Do not make this
+        # dialog transient to that hidden window or Windows may hide it too.
+        self.grab_set()
+        self.deiconify()
+        self.lift()
+        self.email = tk.StringVar()
+        self.code = tk.StringVar()
+        self.password = tk.StringVar()
+        self.confirm_password = tk.StringVar()
+
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text="電子郵件：").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        email_entry = ttk.Entry(frame, textvariable=self.email, width=34)
+        email_entry.grid(row=0, column=1, sticky="ew", pady=(0, 6))
+        ttk.Button(frame, text="寄送驗證碼", command=self._request_code).grid(
+            row=0, column=2, padx=(8, 0), pady=(0, 6)
+        )
+        ttk.Label(frame, text="驗證碼：").grid(row=1, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.code, width=34).grid(row=1, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(frame, text="新密碼：").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.password, show="*", width=34).grid(row=2, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(frame, text="確認新密碼：").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(frame, textvariable=self.confirm_password, show="*", width=34).grid(row=3, column=1, columnspan=2, sticky="ew", pady=6)
+        ttk.Label(frame, text="驗證碼有效 10 分鐘，最多可嘗試 5 次。", foreground="#6b7280").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(4, 12)
+        )
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="重設密碼", command=self._confirm).pack(side="right", padx=(0, 8))
+        email_entry.focus_set()
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _request_code(self) -> None:
+        email = self.email.get().strip()
+        if not email:
+            messagebox.showwarning(APP_NAME, "請輸入電子郵件地址。", parent=self)
+            return
+        try:
+            self.client.request_password_reset(email)
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"無法寄送驗證碼：\n{exc.detail}", parent=self)
+            return
+        messagebox.showinfo(APP_NAME, "若此信箱已註冊，驗證碼已寄出。", parent=self)
+
+    def _confirm(self) -> None:
+        email = self.email.get().strip()
+        code = self.code.get().strip()
+        password = self.password.get()
+        if not email or not code or not password:
+            messagebox.showwarning(APP_NAME, "請完整填寫電子郵件、驗證碼與新密碼。", parent=self)
+            return
+        if password != self.confirm_password.get():
+            messagebox.showwarning(APP_NAME, "兩次輸入的新密碼不一致。", parent=self)
+            return
+        try:
+            self.client.confirm_password_reset(email=email, code=code, password=password)
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"無法重設密碼：\n{exc.detail}", parent=self)
+            return
+        messagebox.showinfo(APP_NAME, "密碼已重設，請以新密碼登入。", parent=self)
+        self.destroy()
+
+
+class EmailVerificationDialog(tk.Toplevel):
+    """Require a verified address before the desktop enters the workspace."""
+
+    def __init__(self, parent: tk.Misc, client: WorkspaceClient, email: str = "") -> None:
+        super().__init__(parent)
+        self.client = client
+        self.result = False
+        self.title(f"{APP_NAME} — 驗證電子郵件")
+        self.resizable(False, False)
+        # The root is withdrawn while authentication runs. Do not make this
+        # dialog transient to that hidden window or Windows may hide it too.
+        self.grab_set()
+        self.deiconify()
+        self.lift()
+        self.email = tk.StringVar(value=email)
+        self.code = tk.StringVar()
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text="需要驗證電子郵件才能繼續。", wraplength=340).grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
+        )
+        ttk.Label(frame, text="電子郵件：").grid(row=1, column=0, sticky="w", pady=5)
+        email_entry = ttk.Entry(frame, textvariable=self.email, width=34)
+        email_entry.grid(row=1, column=1, sticky="ew", pady=5)
+        ttk.Button(frame, text="寄送驗證碼", command=self._request).grid(row=1, column=2, padx=(8, 0), pady=5)
+        ttk.Label(frame, text="驗證碼：").grid(row=2, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.code, width=34).grid(row=2, column=1, columnspan=2, sticky="ew", pady=5)
+        ttk.Label(frame, text="驗證碼有效 10 分鐘，最多可嘗試 5 次。", foreground="#6b7280").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(4, 12)
+        )
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, text="稍後驗證", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="完成驗證", command=self._confirm).pack(side="right", padx=(0, 8))
+        email_entry.focus_set()
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _request(self) -> None:
+        email = self.email.get().strip()
+        if not email:
+            messagebox.showwarning(APP_NAME, "請輸入電子郵件地址。", parent=self)
+            return
+        try:
+            self.client.request_email_verification(email)
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"無法寄送驗證碼：\n{exc.detail}", parent=self)
+            return
+        messagebox.showinfo(APP_NAME, "驗證碼已寄出。", parent=self)
+
+    def _confirm(self) -> None:
+        email = self.email.get().strip()
+        code = self.code.get().strip()
+        if not email or not code:
+            messagebox.showwarning(APP_NAME, "請輸入電子郵件與驗證碼。", parent=self)
+            return
+        try:
+            self.client.confirm_email_verification(email=email, code=code)
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"驗證失敗：\n{exc.detail}", parent=self)
+            return
+        self.result = True
+        self.destroy()
+
+
+class LoginDialog(tk.Toplevel):
+    """Login dialog that deliberately remembers only an opaque session token."""
+
+    def __init__(self, parent: tk.Misc, client: WorkspaceClient, *, bootstrap: bool = False) -> None:
+        super().__init__(parent)
+        self.client = client
+        self.bootstrap = bootstrap
+        self.result: dict[str, str | bool] | None = None
+        self.title(f"{APP_NAME} — {'建立第一位管理員' if bootstrap else '登入'}")
+        self.resizable(False, False)
+        # The root is withdrawn while authentication runs. Do not make this
+        # dialog transient to that hidden window or Windows may hide it too.
+        self.grab_set()
+        self.deiconify()
+        self.lift()
+        self.username = tk.StringVar()
+        self.email = tk.StringVar()
+        self.password = tk.StringVar()
+        self.remember = tk.BooleanVar(value=True)
+
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky="nsew")
+        ttk.Label(frame, text="帳號：").grid(row=0, column=0, sticky="w", pady=5)
+        username_entry = ttk.Entry(frame, textvariable=self.username, width=35)
+        username_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=5)
+        row = 1
+        if bootstrap:
+            ttk.Label(frame, text="電子郵件：").grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(frame, textvariable=self.email, width=35).grid(row=row, column=1, columnspan=2, sticky="ew", pady=5)
+            row += 1
+        ttk.Label(frame, text="密碼：").grid(row=row, column=0, sticky="w", pady=5)
+        password_entry = ttk.Entry(frame, textvariable=self.password, show="*", width=35)
+        password_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=5)
+        row += 1
+        ttk.Checkbutton(frame, text="記住登入（只保存安全的登入憑證）", variable=self.remember).grid(
+            row=row, column=0, columnspan=3, sticky="w", pady=(4, 8)
+        )
+        row += 1
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=row, column=0, columnspan=3, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="取消", command=self._cancel).pack(side="right")
+        ttk.Button(buttons, text="確定", command=self._submit).pack(side="right", padx=(0, 8))
+        if not bootstrap:
+            ttk.Button(buttons, text="忘記密碼", command=self._forgot_password).pack(side="left")
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Return>", lambda _event: self._submit())
+        self.bind("<Escape>", lambda _event: self._cancel())
+        username_entry.focus_set()
+
+    def _forgot_password(self) -> None:
+        dialog = PasswordResetDialog(self, self.client)
+        self.wait_window(dialog)
+        if self.winfo_exists():
+            self.grab_set()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self.destroy()
+
+    def _submit(self) -> None:
+        username = self.username.get().strip()
+        password = self.password.get()
+        if not username or not password:
+            messagebox.showwarning(APP_NAME, "請輸入帳號與密碼。", parent=self)
+            return
+        if self.bootstrap and not self.email.get().strip():
+            messagebox.showwarning(APP_NAME, "請輸入電子郵件地址，用於驗證與忘記密碼。", parent=self)
+            return
+        self.result = {
+            "username": username,
+            "password": password,
+            "email": self.email.get().strip(),
+            "remember": self.remember.get(),
+        }
+        self.destroy()
+
+
+def _prompt_login(parent: tk.Misc, client: WorkspaceClient, *, bootstrap: bool = False) -> dict[str, str | bool] | None:
+    dialog = LoginDialog(parent, client, bootstrap=bootstrap)
+    parent.wait_window(dialog)
+    return dialog.result
+
+
+def _ensure_email_verified(parent: tk.Misc, client: WorkspaceClient) -> bool:
+    profile = client.me()
+    if profile.get("email_verified"):
+        return True
+    dialog = EmailVerificationDialog(parent, client, str(profile.get("email") or ""))
+    parent.wait_window(dialog)
+    return dialog.result
+
+
+class SmtpSettingsDialog(tk.Toplevel):
+    """Administrator-only editor for the service's outbound mail transport."""
+
+    _SECURITY_LABELS = {
+        "none": "無加密",
+        "starttls": "STARTTLS",
+        "ssl": "SSL/TLS",
+    }
+    _SECURITY_VALUES = {value: key for key, value in _SECURITY_LABELS.items()}
+
+    def __init__(self, parent: tk.Misc, client: WorkspaceClient) -> None:
+        super().__init__(parent)
+        self.client = client
+        self.title(f"{APP_NAME} — 郵件設定")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self.host = tk.StringVar()
+        self.port = tk.StringVar()
+        self.from_address = tk.StringVar()
+        self.security = tk.StringVar(value="無加密")
+        self.username = tk.StringVar()
+        self.password = tk.StringVar()
+        self.clear_password = tk.BooleanVar(value=False)
+        self.test_recipient = tk.StringVar()
+        self._has_password = False
+
+        frame = ttk.Frame(self, padding=16)
+        frame.grid(sticky="nsew")
+        fields = (
+            ("SMTP 主機：", self.host),
+            ("連接埠：", self.port),
+            ("寄件者 email：", self.from_address),
+        )
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=5)
+            ttk.Entry(frame, textvariable=variable, width=40).grid(
+                row=row, column=1, columnspan=2, sticky="ew", pady=5
+            )
+        ttk.Label(frame, text="連線安全：").grid(row=3, column=0, sticky="w", pady=5)
+        security_box = ttk.Combobox(
+            frame, textvariable=self.security, state="readonly", width=37,
+            values=tuple(self._SECURITY_VALUES),
+        )
+        security_box.grid(row=3, column=1, columnspan=2, sticky="ew", pady=5)
+        ttk.Label(frame, text="SMTP 帳號：").grid(row=4, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.username, width=40).grid(
+            row=4, column=1, columnspan=2, sticky="ew", pady=5
+        )
+        ttk.Label(frame, text="SMTP 密碼：").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.password, show="*", width=40).grid(
+            row=5, column=1, columnspan=2, sticky="ew", pady=5
+        )
+        self.password_hint = ttk.Label(frame, foreground="#6b7280")
+        self.password_hint.grid(row=6, column=1, columnspan=2, sticky="w")
+        ttk.Checkbutton(
+            frame, text="清除已保存的 SMTP 密碼", variable=self.clear_password,
+        ).grid(row=7, column=1, columnspan=2, sticky="w", pady=(2, 8))
+
+        ttk.Separator(frame).grid(row=8, column=0, columnspan=3, sticky="ew", pady=(4, 10))
+        ttk.Label(frame, text="測試收件者：").grid(row=9, column=0, sticky="w", pady=5)
+        ttk.Entry(frame, textvariable=self.test_recipient, width=40).grid(
+            row=9, column=1, columnspan=2, sticky="ew", pady=5
+        )
+        ttk.Label(frame, text="儲存後可寄送測試信。", foreground="#6b7280").grid(
+            row=10, column=1, columnspan=2, sticky="w", pady=(0, 10)
+        )
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=11, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="儲存", command=self._save).pack(side="right", padx=(0, 8))
+        ttk.Button(buttons, text="儲存並寄測試信", command=self._save_and_test).pack(
+            side="right", padx=(0, 8)
+        )
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            settings = self.client.get_mail_settings()
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"無法讀取郵件設定：\n{exc.detail}", parent=self)
+            self.destroy()
+            return
+        self.host.set(str(settings.get("host") or ""))
+        self.port.set(str(settings.get("port") or ""))
+        self.from_address.set(str(settings.get("from_address") or ""))
+        self.security.set(self._SECURITY_LABELS.get(str(settings.get("security") or "none"), "無加密"))
+        self.username.set(str(settings.get("username") or ""))
+        self._has_password = bool(settings.get("has_password"))
+        self.password_hint.configure(
+            text="已保存密碼；留空即保留不變。" if self._has_password else "尚未保存密碼。"
+        )
+
+    def _payload(self) -> dict[str, object]:
+        try:
+            port = int(self.port.get().strip())
+        except ValueError:
+            raise ValueError("SMTP 連接埠必須是數字。") from None
+        security = self._SECURITY_VALUES.get(self.security.get())
+        if not self.host.get().strip() or not self.from_address.get().strip() or not security:
+            raise ValueError("請完整填寫 SMTP 主機、寄件者與連線安全模式。")
+        if self.clear_password.get():
+            password: str | None = ""
+        elif self.password.get():
+            password = self.password.get()
+        elif self._has_password:
+            password = "__UNCHANGED__"
+        else:
+            password = None
+        return {
+            "host": self.host.get().strip(),
+            "port": port,
+            "from_address": self.from_address.get().strip(),
+            "security": security,
+            "username": self.username.get().strip() or None,
+            "password": password,
+        }
+
+    def _save_settings(self) -> bool:
+        try:
+            self.client.update_mail_settings(**self._payload())
+        except ValueError as exc:
+            messagebox.showwarning(APP_NAME, str(exc), parent=self)
+            return False
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"無法儲存郵件設定：\n{exc.detail}", parent=self)
+            return False
+        self.password.set("")
+        self.clear_password.set(False)
+        self._has_password = bool(self.username.get().strip())
+        self.password_hint.configure(text="設定已保存；密碼不會再顯示。")
+        return True
+
+    def _save(self) -> None:
+        if self._save_settings():
+            messagebox.showinfo(APP_NAME, "郵件設定已保存，立即生效。", parent=self)
+
+    def _save_and_test(self) -> None:
+        if not self._save_settings():
+            return
+        recipient = self.test_recipient.get().strip()
+        if not recipient:
+            messagebox.showwarning(APP_NAME, "請輸入測試收件者 email。", parent=self)
+            return
+        try:
+            self.client.test_mail_settings(recipient)
+        except ApiError as exc:
+            messagebox.showerror(APP_NAME, f"測試信寄送失敗：\n{exc.detail}", parent=self)
+            return
+        messagebox.showinfo(APP_NAME, "測試信已交給 SMTP 伺服器。", parent=self)
 
 LIGHT_COLORS = {
     "bg": "#f6f7f9",
@@ -245,9 +631,12 @@ class TreeAgentApp:
         root: tk.Tk,
         home: str = store.DEFAULT_HOME,
         single_instance: bool = True,
+        workspace: store.Workspace | RemoteWorkspace | None = None,
     ) -> None:
         self.root = root
-        self.lock = store.WorkspaceLock(home) if single_instance else None
+        # A server owns concurrency in shared mode.  The old lock protects only
+        # the explicitly selected JSON compatibility mode.
+        self.lock = store.WorkspaceLock(home) if single_instance and workspace is None else None
         if self.lock is not None and not self.lock.acquire():
             if not messagebox.askyesno(
                 APP_NAME,
@@ -261,7 +650,7 @@ class TreeAgentApp:
                 raise SystemExit(0)
             self.lock = None  # user chose to proceed unprotected
 
-        self.ws = store.Workspace(home)
+        self.ws = workspace or store.Workspace(home)
         self.turns: dict[str, codex_runner.Turn] = {}
         # Each turn is stamped with a serial number. Cancelling is asynchronous,
         # so events already queued by a killed turn can still arrive after the
@@ -415,6 +804,8 @@ class TreeAgentApp:
         file_menu.add_command(label="開啟工作區資料夾", command=self.open_workspace_folder)
         file_menu.add_command(label="Agent 設定…", command=self.edit_agents)
         file_menu.add_command(label="預設值設定…", command=self.edit_defaults)
+        if isinstance(self.ws, RemoteWorkspace):
+            file_menu.add_command(label="郵件設定…", command=self.edit_mail_settings)
         file_menu.add_separator()
         file_menu.add_command(label="離開", command=self.on_close)
         menubar.add_cascade(label="檔案", menu=file_menu)
@@ -1088,6 +1479,9 @@ class TreeAgentApp:
         self._retire_turn(node_id)
         self.conv_view.drop_queue(node_id)
         self.ws.clear_thread(node_id)
+        node = self.ws.find(node_id)
+        if node is None:
+            return
         self.refresh_node_label(node_id)
         self.conv_view.show(node)
         self.set_status(f"「{node['name']}」已重設，下次送出會開一個新的 Agent session")
@@ -1334,10 +1728,24 @@ class TreeAgentApp:
         _open_in_explorer(self.ws.home)
 
     def edit_defaults(self) -> None:
+        if isinstance(self.ws, RemoteWorkspace):
+            messagebox.showinfo(
+                APP_NAME,
+                "共用服務的預設值由服務主機設定。請在服務設定中調整；"
+                "個別專案設定仍可在右側面板修改。",
+                parent=self.root,
+            )
+            return
         DefaultsDialog(self.root, self)
 
     def edit_agents(self) -> None:
         AgentsDialog(self.root, self)
+
+    def edit_mail_settings(self) -> None:
+        if not isinstance(self.ws, RemoteWorkspace):
+            messagebox.showinfo(APP_NAME, "郵件設定只能在共用服務模式使用。", parent=self.root)
+            return
+        SmtpSettingsDialog(self.root, self.ws.client)
 
     def show_about(self) -> None:
         messagebox.showinfo(
@@ -1672,8 +2080,11 @@ class TreeAgentApp:
             session_id = event.get("session_id")
             conv = self.ws.find(conv_id)
             if session_id and conv is not None:
-                conv["claude_session_id"] = session_id
-                self.ws.save()
+                if hasattr(self.ws, "set_claude_session_id"):
+                    self.ws.set_claude_session_id(conv_id, session_id)
+                else:
+                    conv["claude_session_id"] = session_id
+                    self.ws.save()
                 if visible:
                     self.conv_view.refresh_header()
         elif kind == "turn_start":
@@ -3567,11 +3978,125 @@ def main(argv: list[str] | None = None) -> None:
         default=store.DEFAULT_HOME,
         help="工作區資料夾（預設 ~/.tree_agent），可用來分開多組工作區",
     )
+    parser.add_argument("--server", default=os.environ.get("TREE_AGENT_SERVER_URL"),
+                        help="共用 Workspace 服務網址（或設定 TREE_AGENT_SERVER_URL）")
+    parser.add_argument("--token", default=os.environ.get("TREE_AGENT_TOKEN"),
+                        help="服務登入 token（建議以 TREE_AGENT_TOKEN 提供）")
+    parser.add_argument("--bootstrap-token", default=os.environ.get("TREE_AGENT_BOOTSTRAP_TOKEN"),
+                        help="首次建立管理員的一次性 token（僅由本機啟動器傳入）")
+    parser.add_argument("--legacy-local", action="store_true",
+                        help="僅用於遷移：直接讀寫本機 workspace.json")
     args = parser.parse_args(argv)
 
     _enable_dpi_awareness()
     root = TkinterDnD.Tk() if TkinterDnD is not None else tk.Tk()
-    TreeAgentApp(root, home=args.home)
+    # Authentication may show before TreeAgentApp builds the main window.
+    # Name the root for when it is restored as the finished main window.
+    root.title(APP_NAME)
+    # The authentication dialogs are independent top-level windows.  Keep the
+    # otherwise empty root hidden until TreeAgentApp is ready to build its UI.
+    root.withdraw()
+    workspace = None
+    if not args.legacy_local:
+        if not args.server:
+            root.withdraw()
+            messagebox.showerror(
+                APP_NAME,
+                "需要共用服務網址。請用 --server 或設定 TREE_AGENT_SERVER_URL。\n"
+                "舊的 workspace.json 模式只能以 --legacy-local 明確啟用。",
+            )
+            root.destroy()
+            return
+        session_store = SessionStore(args.home)
+        supplied_token = args.token
+        remembered_token = None if supplied_token else session_store.load()
+        client = WorkspaceClient(args.server, token=supplied_token or remembered_token)
+        try:
+            health = client.health()
+        except ApiError as exc:
+            root.withdraw()
+            messagebox.showerror(APP_NAME, f"無法使用共用服務：\n{exc}")
+            root.destroy()
+            return
+        if health.get("needs_bootstrap"):
+            if not args.bootstrap_token:
+                messagebox.showerror(
+                    APP_NAME,
+                    "這是尚未初始化的服務，但找不到一次性初始化 token。\n"
+                    "請用 run.cmd 啟動新服務，或由服務管理員提供 token。",
+                    parent=root,
+                )
+                root.destroy()
+                return
+            credentials = _prompt_login(root, client, bootstrap=True)
+            if not credentials:
+                root.destroy()
+                return
+            try:
+                client.bootstrap(
+                    token=args.bootstrap_token,
+                    username=str(credentials["username"]),
+                    password=str(credentials["password"]),
+                    email=str(credentials["email"]),
+                )
+                client.login(str(credentials["username"]), str(credentials["password"]))
+                if bool(credentials["remember"]):
+                    session_store.save(client.token or "")
+                # run.cmd keeps the one-time token only so a failed first GUI
+                # launch can be retried.  Once bootstrap succeeds it must not
+                # remain readable from the user's local profile.
+                token_file = os.environ.get("TREE_AGENT_BOOTSTRAP_TOKEN_FILE")
+                if token_file:
+                    try:
+                        os.remove(token_file)
+                    except OSError:
+                        pass
+            except ApiError as bootstrap_error:
+                messagebox.showerror(APP_NAME, f"建立管理員失敗：\n{bootstrap_error}", parent=root)
+                root.destroy()
+                return
+        else:
+            try:
+                client.me()
+            except ApiError as exc:
+                if exc.status not in (0, 401, 403):
+                    root.withdraw()
+                    messagebox.showerror(APP_NAME, f"無法使用共用服務：\n{exc}")
+                    root.destroy()
+                    return
+                if remembered_token:
+                    session_store.clear()
+                    client.token = None
+                credentials = _prompt_login(root, client)
+                if not credentials:
+                    root.destroy()
+                    return
+                try:
+                    client.login(str(credentials["username"]), str(credentials["password"]))
+                    if not supplied_token:
+                        if bool(credentials["remember"]):
+                            session_store.save(client.token or "")
+                        else:
+                            session_store.clear()
+                except ApiError as login_error:
+                    messagebox.showerror(APP_NAME, f"登入失敗：\n{login_error}", parent=root)
+                    root.destroy()
+                    return
+        try:
+            # Email verification enables password recovery but is deliberately
+            # not a gate for opening the shared workspace. Existing users can
+            # choose "稍後驗證" and continue working immediately.
+            _ensure_email_verified(root, client)
+        except ApiError as email_error:
+            messagebox.showwarning(
+                APP_NAME, f"暫時無法確認電子郵件驗證狀態：\n{email_error}\n\n仍可繼續使用。",
+                parent=root,
+            )
+        workspace = RemoteWorkspace(client, args.home)
+    # Login/bootstrap hides the temporary root so prompts do not leave an
+    # empty window behind.  Restore it before constructing the main UI.
+    root.deiconify()
+    TreeAgentApp(root, home=args.home, workspace=workspace)
     root.mainloop()
 
 

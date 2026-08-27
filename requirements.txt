@@ -1,3 +1,7 @@
+# Desktop client.
 # PDF reading, page previews, and PDF drag-and-drop in the input box.
 PyMuPDF>=1.24
 tkinterdnd2>=0.4
+
+# The desktop client talks to the workspace service over plain HTTP from the
+# standard library, so nothing else is needed to run the GUI.

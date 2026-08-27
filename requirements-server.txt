@@ -1,0 +1,12 @@
+# Workspace service host only. Install these on the one machine that owns the
+# SQLite database; desktop clients need nothing from this file.
+#
+#   python -m pip install -r requirements-server.txt
+#   python -m tree_agent.server --db D:\TreeAgentData\tree-agent.db
+#
+# SQLite itself must be 3.35+ with FTS5 compiled in; the service checks both at
+# startup and refuses to run without them.
+fastapi>=0.110
+uvicorn>=0.27
+argon2-cffi>=23.1
+cryptography>=42.0

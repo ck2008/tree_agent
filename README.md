@@ -400,6 +400,69 @@ Tree Agent 會**在你按下送出之前**就偵測到這個組合，在對話�
 
 Codex 自己的 session 檔案仍然放在 `~/.codex/sessions`，Tree Agent 只保存 `thread_id` 並透過 `codex exec resume` 接續，沒有另外複製一份對話。
 
+## 多人共用：SQLite 服務
+
+上面那個 `workspace.json` 是單人版：一台電腦、一個視窗、一份檔案。要讓一組人共用同一份工作區，就換成 `tree_agent/server/` 這個服務：**一台主機**開一份 SQLite，桌面端一律走 HTTPS，不會有第二個行程去碰那個 `.db`。
+
+規則很硬，因為破例的代價是資料損毀：資料庫必須放在服務主機的**本機磁碟**，不可以放在 NAS 或共享磁碟再讓多台電腦各自開檔（SQLite 在 SMB 上的鎖並不可靠）。服務啟動時就會檢查路徑，UNC 與網路磁碟直接拒絕。
+
+```bash
+python -m pip install -r requirements-server.txt
+python -m tree_agent.server --db D:\TreeAgentData\tree-agent.db
+```
+
+第一次啟動沒有任何帳號，也沒有預設帳密。主控台會印出一組一次性初始化密碼，用它建立第一位管理員，用過即失效。桌面程式會同時要求填入電子郵件並寄送驗證碼；CLI 呼叫也必須帶 `email`：
+
+```bash
+curl -X POST http://127.0.0.1:8765/api/auth/bootstrap -H "Content-Type: application/json" -d "{\"token\":\"<印出來的那組>\",\"username\":\"admin\",\"password\":\"...\",\"email\":\"admin@example.com\"}"
+```
+
+### 這個服務保證什麼
+
+| 主題 | 做法 |
+| --- | --- |
+| 併發寫入 | 程序內單一 FIFO writer queue，一個執行緒持有唯一的寫入連線；讀取連線各自獨立，不排隊。這就是使用者不會看到 `database is locked` 的原因 |
+| 同時編輯 | project 與 conversation 帶 `revision`；修改要附上你讀到的版本，不符就回 `409` 並告訴你目前版本，不做 last-write-wins |
+| 權限 | 從目標專案往根找**這位使用者**的 membership，第一個找到的就是有效權限；子專案可以往上或往下覆寫。看不到的專案回 `404` 而不是 `403`，所以沒辦法用 id 掃出整棵樹 |
+| 刪除 | 一律軟刪除，整個子樹蓋同一個時間戳，復原時只還原那一批（上週就單獨刪掉的子專案不會跟著復活）。永久清除由管理員手動執行，保留期不得低於 30 天 |
+| 附件 | 直接存在 SQLite，但永遠以 1 MiB 為單位進出，單檔上限 20 MiB。commit 時才驗證 chunk 連續、總長度與 SHA-256；相同內容以雜湊去重，只存一份 |
+| 重送 | 寫入 API 接受 `Idempotency-Key`：key 先被登記再開始做事，所以斷線重試拿回原本的結果，不會建出第二則訊息或第二個附件 |
+| 全文搜尋 | FTS5，中文以單字為 token（`unicode61` 會把一整串中文當成一個 token，那樣搜「專案」永遠搜不到「我的專案」）。搜尋一律先算出可見專案再進索引，最後再回主表確認沒被刪 |
+| 備份 | SQLite online backup API，管理員觸發，完成後跑 `integrity_check` |
+
+密碼用 Argon2id；session token 是 32 bytes 隨機值，資料庫只留 SHA-256，cookie 帶 `HttpOnly`／`Secure`／`SameSite=Lax`。日誌不記訊息內容、附件位元組、token 或密碼。
+
+### 帳號、信箱與忘記密碼
+
+每個帳號的電子郵件地址必須唯一並完成驗證。忘記密碼會寄送一次性驗證碼到已驗證的信箱；驗證碼 10 分鐘後失效，最多嘗試 5 次，資料庫只保存加鹽雜湊。重設成功會立即撤銷該帳號所有既有 session。
+
+初始 SMTP 預設為本機 relay：`127.0.0.1:25`、無 SMTP AUTH／TLS、寄件者 `ck@eic.com.tw`。管理員可在「檔案 → 郵件設定」改為任意 SMTP 主機、連接埠、無加密／STARTTLS／SSL/TLS、帳號與密碼，並寄送測試信。設定立即生效；SMTP 密碼在 Windows 服務主機以 DPAPI 加密保存，永不顯示或回傳。
+
+### 從舊工作區搬過去
+
+`tree_agent/server/migrations/legacy_workspace_import.py` 讀既有的 `workspace.json` 與 `attachments/`：只有管理員能執行，只有明確指定檔案才會跑，而且不會覆蓋既有資料。原始檔會先複製成唯讀備份；整個匯入是單一交易，中途失敗全部 rollback，只有單列層級的問題（圖檔不見、沒見過的角色）會記進 `migration_reports` 而不中斷其他資料。
+
+```python
+from tree_agent.client_api import WorkspaceClient
+
+client = WorkspaceClient("https://your-host")
+client.login("admin", "...")
+print(client.import_legacy_workspace(r"C:\Users\me\.tree_agent\workspace.json", dry_run=True))
+```
+
+`dry_run` 會先告訴你將匯入幾個專案／對話／訊息，以及哪些圖檔已經不在了。
+
+### 桌面端連線
+
+桌面程式預設只使用共用服務；它不會在正式模式讀寫 `workspace.json`。專案、對話、訊息、附件與 Codex／Claude runner session 都經 API 儲存。每台桌面電腦只在 `--home` 下保留 `desktop.json`（視窗、主題與本機 runner 路徑）、可重新下載的附件快取，以及可選的「記住登入」session token。該 token 使用 Windows DPAPI 以目前 Windows 使用者帳號加密；密碼絕不寫入磁碟。
+
+```bash
+python -m tree_agent --server https://tree-agent.example
+# 或設定 TREE_AGENT_SERVER_URL；token 可透過 TREE_AGENT_TOKEN 提供，否則啟動時登入。
+```
+
+Codex 與 Claude Code 仍由每位使用者的桌面電腦執行；其 thread/session、訊息、工具紀錄與用量會即時寫回服務。`--legacy-local` 是僅供遷移／離線救援的明確相容旗標，才會直接讀寫舊的 `workspace.json`。
+
 ## 架構
 
 | 檔案 | 職責 |
@@ -410,6 +473,11 @@ Codex 自己的 session 檔案仍然放在 `~/.codex/sessions`，Tree Agent 只�
 | [tree_agent/transfer.py](tree_agent/transfer.py) | 匯出／匯入：zip 打包、id 重新產生、附件搬遷、Markdown 輸出 |
 | [tree_agent/clipboard_image.py](tree_agent/clipboard_image.py) | 用 ctypes 從 Win32 剪貼簿取出點陣圖，轉成 PNG（BMP 為備援） |
 | [tree_agent/app.py](tree_agent/app.py) | Tkinter UI：專案樹、對話檢視、專案設定、事件 pump |
+| [tree_agent/client_api.py](tree_agent/client_api.py) | 共用工作區服務的 HTTP client，只用標準函式庫 |
+| [tree_agent/server/db.py](tree_agent/server/db.py) | SQLite 連線、pragma、writer queue、migration runner、備份 |
+| [tree_agent/server/auth.py](tree_agent/server/auth.py) | Argon2id 密碼、session token、帳號管理、第一位管理員的初始化 |
+| [tree_agent/server/services/](tree_agent/server/services/) | 權限判定、樹狀規則、訊息與工具呼叫、附件、搜尋、保留期清理 |
+| [tree_agent/server/api.py](tree_agent/server/api.py) | FastAPI 路由：認證、驗證輸入、呼叫一個 service method |
 
 ### 怎麼呼叫 Codex
 
@@ -452,9 +520,18 @@ Codex 的回覆是 Markdown，會渲染成標題、粗體/斜體、行內 code�
 python tests/run_all.py
 ```
 
-二十五個套件，約 65 秒：
+三十四個套件，約兩分鐘：
 
 - `test_core` — 樹狀結構、設定繼承、搬移合法性（含不能把專案拖進自己的子樹）、持久化、損毀檔復原、指令組裝、事件格式化。**離線執行。**
+- `test_server_ids` — 排序鍵：五萬次尾端新增／開頭插入都維持四個字元、三萬次隨機插入不重複也不亂序、同一個縫隙切到極限會要求重排而不是無限變長、重排後每個位置兩側都還有空間、壞掉的輸入會明確拋錯而不是產生排錯的鍵。**離線執行，不開 Tk。**
+- `test_server_db` — migration 只套用一次且有紀錄、每條連線都拿到規格要求的 pragma、二十條執行緒各五十次讀改寫透過 writer queue 得到正好 1000、失敗的 job 完整 rollback、寫入進行中讀取不被擋、備份可獨立驗證、網路路徑被拒絕。**離線執行，不開 Tk。**
+- `test_server_core` — 樹狀規則搬到服務層之後仍然成立：巢狀與路徑、設定就近繼承、對話自己的 model 優先、提示詞累加、同層不撞名、搬移合法性、同層重新排序、`revision` 衝突回 409 且資料不遺失、分岔複製逐字稿與來源標記、軟刪除與復原（含名稱衝突、以及「先單獨刪掉的不跟著復活」）、重設對話、用量加總、180 個兄弟節點強迫重排後仍正確。**離線執行，不開 Tk。**
+- `test_server_auth` — 沒有預設帳號、初始化密碼只能用一次、登入與偽造 token、改密碼會作廢舊 session、密碼不以明文保存、權限沿著樹繼承且子專案可雙向覆寫、別人的授權不影響你、`viewer` 帳號無論拿到什麼授權都是唯讀、只有 owner 能改授權、建立者自動成為 owner、停用帳號立刻切斷 session、最後一位管理員不能自我降級。**離線執行，不開 Tk。**
+- `test_server_search` — 中文搜得到字串中間（「附件」找得到「放進附件」）、英文與中英混合、去掉重音的比對、專案提示詞可搜、工具輸出刻意不入索引、搜尋框裡的 FTS 語法被當成字面而不是語法、先過權限再進索引、對話搬家會重建它與所有訊息的索引、軟刪除消失／復原回來、改內容索引跟著改。**離線執行，不開 Tk。**
+- `test_server_attachments` — 20 MiB 附件上傳／下載／雜湊驗證，且過程中單次最多只握住 1 MiB、多一個 byte 被拒、相同內容只存一份、chunk 不完整不能 commit 且暫存區不可見、SHA-256 對不上會被拒、逾時上傳被清掉、光有附件 id 讀不到別人的檔、解除關聯不會刪掉別人還在用的 bytes、軟刪除連附件一起隱藏且可復原、重啟服務後仍完整、檔名不能夾帶路徑或控制字元。**離線執行，不開 Tk。**
+- `test_server_retention` — 只有管理員能清、保留期不得低於 30 天、未到期什麼都不清且仍可復原、到期後 dry run 只報告、真的清除之後留下的正好是還連得到的東西、共用的附件因為還有別人引用而留下、沒人引用的被刪、`foreign_key_check` 與 `integrity_check` 都乾淨、分岔在來源被清除後保留 provenance 但不留死指標。**離線執行，不開 Tk。**
+- `test_server_migration` — 用 `store.Workspace` 真的產生一份舊工作區再匯入：只有管理員能執行、dry run 不寫入、結構／設定／提示詞／thread id／agent／分岔來源都對得上、訊息順序與序號連續、`agent_tool` 轉成 tool 訊息、沒見過的角色轉成 notice 但保留原值、附件位元組與磁碟上的檔案雜湊一致且相同內容只存一份、原始檔被複製成唯讀備份且未被修改、結構違規的檔案整份拒絕、中途失敗完整 rollback 並記錄 `migration_reports`。**離線執行，不開 Tk。**
+- `test_server_client` — 真的起一個 uvicorn，用 `client_api.py` 全程走 HTTP：未登入拿 401、同一個 `Idempotency-Key` 重送只建立一則訊息、同 key 不同內容回 409、runner event 以 `external_event_id` 去重、串流 delta 與完成、工具呼叫、過期 `revision` 回 409 且附上目前版本、三條執行緒同時重排同一層而不遺失資料、20 MiB 附件分段上傳下載並比對伺服器的雜湊、未授權者看不到也下載不到、備份還原後仍可登入／搜尋／下載。**離線執行，不開 Tk。**
 - `test_richtext` — Markdown 渲染：標題層級、粗體/斜體/行內 code、fenced code block、巢狀與編號清單、連結、引言、表格、水平線、空行合併、CRLF，以及 Markdown 樣式必須贏過角色樣式的 tag 優先權。**離線執行。**
 - `test_defaults` — 預設沙箱是全權限且在網路磁碟上可用、`default_cwd()` 尊重環境變數／跳過不存在的候選／永遠回傳真實目錄、新工作區會採用、多層子專案一路繼承到 CLI 旗標、專案覆寫仍優先、預設組合不觸發警告。**離線執行。**
 - `test_prompt` — 提示詞由根到葉累加、空白層不產生空行、`include_self=False` 供表單預覽、跨重啟保存；只在新 thread 的第一回合注入、之後與分岔都不重送、沒設定時不加前綴也不留註記；表單顯示與儲存（含 trim 與清空即取消覆寫）、資訊面板顯示生效內容。**離線執行。**
@@ -480,7 +557,7 @@ python tests/run_all.py
 - `test_extra` — 兩個對話同時執行且不互相污染、中途停止、執行中刪除對話、關閉時不留下野生的 `after` callback。
 - `test_resilience` — `save()` 遇到 Windows 檔案共用衝突會重試、持續失敗會如實拋出、單一事件出錯不會讓事件 pump 死掉、合併寫入最後確實落地。
 
-標成 **離線執行** 的不會呼叫 Codex；`test_gui` 與 `test_extra` 會真的跑 `codex exec`，需要已登入的 `codex`。除了 `test_core` 之外都會開 Tk 視窗，所以都需要桌面工作階段（無法在純 headless 環境跑）。
+標成 **離線執行** 的不會呼叫 Codex；`test_gui` 與 `test_extra` 會真的跑 `codex exec`，需要已登入的 `codex`。`test_core` 與所有 `test_server_*` 都不開 Tk，可以在純 headless 環境跑；其餘都會開 Tk 視窗，需要桌面工作階段。
 
 只跑指定套件：
 
