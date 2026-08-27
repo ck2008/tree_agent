@@ -35,6 +35,7 @@ SUITES = [
     "test_server_client",
     "test_server_desktop",
     "test_session_store",
+    "test_preferences",
     "test_richtext",
     "test_user_logs",
     "test_defaults",

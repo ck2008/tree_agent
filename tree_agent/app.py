@@ -33,10 +33,12 @@ if __package__ in (None, ""):  # allow `python app.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     from tree_agent import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
     from tree_agent.client_api import ApiError, RemoteWorkspace, WorkspaceClient
+    from tree_agent.preferences import DesktopPreferences
     from tree_agent.session_store import SessionStore
 else:
     from . import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
     from .client_api import ApiError, RemoteWorkspace, WorkspaceClient
+    from .preferences import DesktopPreferences
     from .session_store import SessionStore
 
 APP_NAME = "Tree Agent"
@@ -119,11 +121,18 @@ class PasswordResetDialog(tk.Toplevel):
 
 
 class EmailVerificationDialog(tk.Toplevel):
-    """Require a verified address before the desktop enters the workspace."""
+    """Offer email verification before the desktop enters the workspace."""
 
-    def __init__(self, parent: tk.Misc, client: WorkspaceClient, email: str = "") -> None:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        client: WorkspaceClient,
+        preferences: DesktopPreferences,
+        email: str = "",
+    ) -> None:
         super().__init__(parent)
         self.client = client
+        self.preferences = preferences
         self.result = False
         self.title(f"{APP_NAME} — 驗證電子郵件")
         self.resizable(False, False)
@@ -148,9 +157,15 @@ class EmailVerificationDialog(tk.Toplevel):
         ttk.Label(frame, text="驗證碼有效 10 分鐘，最多可嘗試 5 次。", foreground="#6b7280").grid(
             row=3, column=0, columnspan=3, sticky="w", pady=(4, 12)
         )
+        self.skip_future = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frame,
+            text="以後不要再跳出這個提示",
+            variable=self.skip_future,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(0, 8))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=0, columnspan=3, sticky="e")
-        ttk.Button(buttons, text="稍後驗證", command=self.destroy).pack(side="right")
+        buttons.grid(row=5, column=0, columnspan=3, sticky="e")
+        ttk.Button(buttons, text="稍後驗證", command=self._skip).pack(side="right")
         ttk.Button(buttons, text="完成驗證", command=self._confirm).pack(side="right", padx=(0, 8))
         email_entry.focus_set()
         self.bind("<Escape>", lambda _event: self.destroy())
@@ -178,7 +193,13 @@ class EmailVerificationDialog(tk.Toplevel):
         except ApiError as exc:
             messagebox.showerror(APP_NAME, f"驗證失敗：\n{exc.detail}", parent=self)
             return
+        self.preferences.set_email_verification_prompt_suppressed(False)
         self.result = True
+        self.destroy()
+
+    def _skip(self) -> None:
+        if self.skip_future.get():
+            self.preferences.set_email_verification_prompt_suppressed(True)
         self.destroy()
 
 
@@ -265,11 +286,17 @@ def _prompt_login(parent: tk.Misc, client: WorkspaceClient, *, bootstrap: bool =
     return dialog.result
 
 
-def _ensure_email_verified(parent: tk.Misc, client: WorkspaceClient) -> bool:
+def _ensure_email_verified(
+    parent: tk.Misc,
+    client: WorkspaceClient,
+    preferences: DesktopPreferences,
+) -> bool:
     profile = client.me()
     if profile.get("email_verified"):
         return True
-    dialog = EmailVerificationDialog(parent, client, str(profile.get("email") or ""))
+    if preferences.email_verification_prompt_suppressed():
+        return False
+    dialog = EmailVerificationDialog(parent, client, preferences, str(profile.get("email") or ""))
     parent.wait_window(dialog)
     return dialog.result
 
@@ -4008,6 +4035,7 @@ def main(argv: list[str] | None = None) -> None:
             root.destroy()
             return
         session_store = SessionStore(args.home)
+        preferences = DesktopPreferences(args.home)
         supplied_token = args.token
         remembered_token = None if supplied_token else session_store.load()
         client = WorkspaceClient(args.server, token=supplied_token or remembered_token)
@@ -4086,7 +4114,7 @@ def main(argv: list[str] | None = None) -> None:
             # Email verification enables password recovery but is deliberately
             # not a gate for opening the shared workspace. Existing users can
             # choose "稍後驗證" and continue working immediately.
-            _ensure_email_verified(root, client)
+            _ensure_email_verified(root, client, preferences)
         except ApiError as email_error:
             messagebox.showwarning(
                 APP_NAME, f"暫時無法確認電子郵件驗證狀態：\n{email_error}\n\n仍可繼續使用。",
