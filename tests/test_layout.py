@@ -90,7 +90,7 @@ print("user right-aligned, Codex left-aligned OK")
 root.update_idletasks(); root.update()
 assert ROLE_LABELS["user"] not in t.get("1.0", "end"), "the 你 label is gone"
 bubble = view._inline_bubbles[-1]
-assert bubble.cget("text") == "**這裡不該被渲染**", bubble.cget("text")
+assert bubble.get("1.0", "end-1c") == "**這裡不該被渲染**", bubble.get("1.0", "end-1c")
 assert str(bubble.cget("bg")) == COLORS["user_bg"], bubble.cget("bg")
 # it hugs the right edge rather than spanning the measure
 offset = bubble.winfo_rootx() - t.winfo_rootx()

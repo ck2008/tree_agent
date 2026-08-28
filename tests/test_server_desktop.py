@@ -66,7 +66,10 @@ class FakeClient:
         self.calls.append(("project", project_id, kwargs))
         self.project.update(kwargs)
         self.project["revision"] += 1
-        return dict(self.project)
+        # Project PATCH replies are a project row, not a tree with cached
+        # children/conversations. Returning only updated fields models that
+        # boundary and prevents the adapter cache from being overwritten.
+        return {"id": project_id, "revision": self.project["revision"], **kwargs}
 
     def update_conversation(self, conversation_id, **kwargs):
         self.calls.append(("conversation", conversation_id, kwargs))
@@ -77,7 +80,8 @@ class FakeClient:
 
 
 client = FakeClient()
-workspace = RemoteWorkspace(client, tempfile.mkdtemp(prefix="tree-agent-desktop-"))
+home = tempfile.mkdtemp(prefix="tree-agent-desktop-")
+workspace = RemoteWorkspace(client, home)
 conversation = workspace.find("conversation-1")
 assert conversation and conversation["kind"] == store.CONVERSATION
 assert conversation["messages"] == []
@@ -96,9 +100,27 @@ workspace.set_option("project-1", "prompt", "shared rule")
 project_call = next(call for call in client.calls if call[0] == "project")
 assert project_call[2]["revision"] == 1 and project_call[2]["prompt"] == "shared rule"
 
+# Local runners must not inherit another computer's shared path or runner.
+calls_before = len(client.calls)
+workspace.set_option("project-1", "cwd", r"D:\Local\Shared")
+workspace.set_option("project-1", "default_agent", store.CLAUDE_AGENT)
+workspace.set_conversation_agent("conversation-1", None)
+assert workspace.resolve("conversation-1")["cwd"] == r"D:\Local\Shared"
+assert workspace.conversation_agent("conversation-1") == store.CLAUDE_AGENT, (
+    workspace.find("project-1"), workspace._execution
+)
+assert workspace.conversation_agent_source("conversation-1") == "專案"
+assert len(client.calls) == calls_before, "local runner settings must not touch shared API"
+record_id = workspace.start_execution_record("conversation-1", {"status": "running"})
+workspace.update_execution_record("conversation-1", record_id, status="completed")
+assert workspace.execution_records("conversation-1")[-1]["status"] == "completed"
+
 # Only UI and per-machine runner preferences are written locally.
 workspace.data["ui"]["theme"] = "dark"
 workspace.set_agent_path("codex", r"C:\\Tools\\codex.exe")
 assert workspace.agent_path("codex") == r"C:\\Tools\\codex.exe"
 assert not (workspace.home and __import__("os").path.exists(__import__("os").path.join(workspace.home, "workspace.json")))
+restored = RemoteWorkspace(client, home)
+assert restored.resolve("conversation-1")["cwd"] == r"D:\Local\Shared"
+assert restored.conversation_agent("conversation-1") == store.CLAUDE_AGENT
 print("desktop adapter: runner events, messages, usage and local preferences OK")

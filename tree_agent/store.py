@@ -139,6 +139,9 @@ def new_project(name: str) -> dict[str, Any]:
         "kind": PROJECT,
         "name": name,
         "cwd": None,
+        # The preferred runner for new descendant conversations. ``None``
+        # deliberately means inherit from the parent project/workspace.
+        "default_agent": None,
         "model": None,
         "sandbox": None,
         # Claude Code has its own permission model; this is deliberately
@@ -192,9 +195,9 @@ def new_conversation(name: str) -> dict[str, Any]:
         "kind": CONVERSATION,
         "name": name,
         "thread_id": None,
-        # The selected runner is deliberately per conversation.  Existing
-        # workspaces have no key, and therefore continue to mean Codex.
-        "agent_id": DEFAULT_AGENT,
+        # ``None`` inherits a project/workspace choice. Existing workspace
+        # documents containing ``codex`` keep their former explicit choice.
+        "agent_id": None,
         "claude_session_id": None,
         # Set when this conversation branched off another one: the source's
         # Codex thread id, used once to `codex exec fork` it. Kept afterwards as
@@ -230,6 +233,7 @@ class Workspace:
                 "model": None,
                 "sandbox": DEFAULT_SANDBOX,
                 "claude_permission": DEFAULT_CLAUDE_PERMISSION,
+                "agent_id": DEFAULT_AGENT,
             },
             "projects": [],
             "ui": {},
@@ -348,14 +352,43 @@ class Workspace:
         self.agents.setdefault(agent_id, {})["path"] = path.strip() or None
         self.save()
 
+    def set_workspace_default(self, key: str, value: Any) -> None:
+        if key not in ("cwd", "agent_id"):
+            raise ValueError("未知的工作區設定")
+        self.defaults[key] = value or None
+        self.save()
+
     def conversation_agent(self, conv_id: str) -> str:
         node = self.find(conv_id)
         if node is None or node["kind"] != CONVERSATION:
             return DEFAULT_AGENT
-        return node.get("agent_id") if node.get("agent_id") in (CODEX_AGENT, CLAUDE_AGENT) else DEFAULT_AGENT
+        if node.get("agent_id") in (CODEX_AGENT, CLAUDE_AGENT):
+            return node["agent_id"]
+        for project in self.ancestors(conv_id):
+            if project.get("default_agent") in (CODEX_AGENT, CLAUDE_AGENT):
+                return project["default_agent"]
+        return self.defaults.get("agent_id") if self.defaults.get("agent_id") in (CODEX_AGENT, CLAUDE_AGENT) else DEFAULT_AGENT
 
-    def set_conversation_agent(self, conv_id: str, agent_id: str) -> None:
-        if agent_id not in (CODEX_AGENT, CLAUDE_AGENT):
+    def conversation_agent_source(self, conv_id: str) -> str:
+        node = self.find(conv_id)
+        if node is not None and node.get("agent_id") in (CODEX_AGENT, CLAUDE_AGENT):
+            return "對話"
+        for project in self.ancestors(conv_id):
+            if project.get("default_agent") in (CODEX_AGENT, CLAUDE_AGENT):
+                return "專案"
+        return "工作區" if self.defaults.get("agent_id") in (CODEX_AGENT, CLAUDE_AGENT) else "Codex CLI"
+
+    def project_agent(self, node_id: str) -> str:
+        project = self.owning_project(node_id)
+        chain = ([project] if project else []) + self.ancestors(project["id"] if project else node_id)
+        for candidate in chain:
+            if candidate and candidate.get("default_agent") in (CODEX_AGENT, CLAUDE_AGENT):
+                return candidate["default_agent"]
+        selected = self.defaults.get("agent_id")
+        return selected if selected in (CODEX_AGENT, CLAUDE_AGENT) else DEFAULT_AGENT
+
+    def set_conversation_agent(self, conv_id: str, agent_id: str | None) -> None:
+        if agent_id is not None and agent_id not in (CODEX_AGENT, CLAUDE_AGENT):
             raise ValueError("未知的 Agent")
         node = self.find(conv_id)
         if node is not None and node["kind"] == CONVERSATION:
@@ -613,6 +646,42 @@ class Workspace:
         conv["updated_at"] = msg["ts"]
         self.touch()
         return msg
+
+    def start_execution_record(self, conv_id: str, record: dict[str, Any]) -> str:
+        conv = self.find(conv_id)
+        if conv is None or conv["kind"] != CONVERSATION:
+            return ""
+        records = conv.setdefault("execution_records", [])
+        record = dict(record)
+        record["id"] = record.get("id") or _new_id()
+        record.setdefault("tools", [])
+        records.append(record)
+        self.touch()
+        return record["id"]
+
+    def execution_records(self, conv_id: str) -> list[dict[str, Any]]:
+        conv = self.find(conv_id)
+        return [dict(record) for record in (conv or {}).get("execution_records", [])]
+
+    def update_execution_record(self, conv_id: str, record_id: str, **fields: Any) -> None:
+        conv = self.find(conv_id)
+        if conv is None:
+            return
+        for record in reversed(conv.get("execution_records") or []):
+            if record.get("id") == record_id:
+                record.update(fields)
+                self.touch()
+                return
+
+    def add_execution_tool(self, conv_id: str, record_id: str, summary: str) -> None:
+        conv = self.find(conv_id)
+        if conv is None:
+            return
+        for record in reversed(conv.get("execution_records") or []):
+            if record.get("id") == record_id:
+                record.setdefault("tools", []).append(summary)
+                self.touch()
+                return
 
     USAGE_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens",
                   "reasoning_output_tokens")

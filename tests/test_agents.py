@@ -4,12 +4,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import json, tempfile, tkinter as tk
 from tree_agent import codex_runner as cr
 from tree_agent import store
-from tree_agent.app import AGENT_LABELS, AgentsDialog, TreeAgentApp
+from tree_agent.app import AGENT_LABELS, INHERIT_AGENT, AgentsDialog, TreeAgentApp
 
 home = tempfile.mkdtemp()
 ws = store.Workspace(home)
 conv = ws.projects[0]["children"][0]
 assert ws.conversation_agent(conv["id"]) == store.CODEX_AGENT
+ws.set_option(ws.projects[0]["id"], "default_agent", store.CLAUDE_AGENT)
+assert ws.conversation_agent(conv["id"]) == store.CLAUDE_AGENT
 ws.set_conversation_agent(conv["id"], store.CLAUDE_AGENT)
 ws.set_agent_path(store.CLAUDE_AGENT, "")
 ws.set_option(ws.projects[0]["id"], "claude_permission", cr.CLAUDE_PERMISSION_BYPASS)
@@ -44,7 +46,7 @@ app = TreeAgentApp(root, home=tempfile.mkdtemp(), single_instance=False)
 node = app.ws.projects[0]["children"][0]
 app.refresh_tree(); app._select(node["id"]); root.update()
 view = app.conv_view
-assert view.agent_var.get() == AGENT_LABELS[store.CODEX_AGENT]
+assert view.agent_var.get() == INHERIT_AGENT
 view.agent_var.set(AGENT_LABELS[store.CLAUDE_AGENT])
 view._on_agent_changed()
 assert app.ws.conversation_agent(node["id"]) == store.CLAUDE_AGENT
@@ -61,6 +63,22 @@ assert "工具：Read" not in view.text.get("1.0", "end")
 tool_logs = [w for holder in view.info_body.winfo_children() for w in holder.winfo_children()
              if isinstance(w, tk.Text)]
 assert tool_logs and "1. 工具：Read" in tool_logs[-1].get("1.0", "end")
+record_id = app.ws.start_execution_record(node["id"], {
+    "agent_id": store.CLAUDE_AGENT, "cwd": home, "mode": "new thread",
+    "started_at": 0, "status": "completed", "duration_seconds": 1.2,
+})
+app.ws.add_execution_tool(node["id"], record_id, "工具：Read")
+view.refresh_info()
+def texts(widget):
+    try:
+        result = [str(widget.cget("text"))]
+    except tk.TclError:
+        result = []
+    for child in widget.winfo_children():
+        result.extend(texts(child))
+    return result
+info_text = "\n".join(texts(view.info_body))
+assert "Agent 執行紀錄（1）" in info_text
 # Imported / older workspaces can already contain agent_tool records.  They
 # must be hidden when the transcript is rebuilt too, not just while streaming.
 app.ws.append_message(node["id"], "agent_tool", "工具：Bash")

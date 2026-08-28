@@ -35,7 +35,9 @@ assert len(view._inline_code_widgets) == 1
 code_frame = view._inline_code_widgets[0]
 code_body = code_frame.winfo_children()[1]
 copy_button = code_frame.winfo_children()[0].winfo_children()[1]
-assert code_body.cget("text") == "node -v\nnpm -v"
+assert code_body.get("1.0", "end-1c") == "node -v\nnpm -v"
+assert str(code_body.cget("state")) == "disabled"
+assert code_body.bind("<Control-c>"), "code text must support copying a selection"
 assert not any(isinstance(child, ttk.Scrollbar) for child in code_frame.winfo_children())
 assert copy_button.cget("text") == "複製"
 assert code_body.bind("<MouseWheel>"), "code card must forward mouse-wheel input"

@@ -122,18 +122,18 @@ class AuthService:
         self._bootstrap_token = bootstrap_token or os.environ.get(
             "TREE_AGENT_BOOTSTRAP_TOKEN"
         )
-        # `/health` is polled during desktop startup.  Keep its answer in this
-        # service instance rather than opening a long-lived reader snapshot on
-        # every poll; the writer connection establishes the initial truth and
-        # bootstrap flips it atomically after the first user is committed.
-        self._has_users = self.db.write(
-            lambda conn: users_repo.count(conn) > 0, label="initial_user_count"
-        )
-
     # ------------------------------------------------------------ bootstrap
 
     def needs_bootstrap(self) -> bool:
-        return not self._has_users
+        """Return the current database state, including writes by another process.
+
+        The local desktop service can remain alive while a prior launcher or
+        recovery path writes the initial administrator.  Caching this value at
+        service startup then leaves the GUI permanently stuck in bootstrap
+        mode, even though the account exists.
+        """
+        with self.db.read() as conn:
+            return users_repo.count(conn) == 0
 
     def bootstrap_admin(
         self, *, token: str, username: str, password: str, email: str, display_name: str = ""
@@ -166,7 +166,6 @@ class AuthService:
             return users_repo.get(conn, user_id)
 
         user = self.db.write(job, label="bootstrap_admin")
-        self._has_users = True
         self._bootstrap_token = None
         return user
 

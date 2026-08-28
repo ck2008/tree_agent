@@ -60,16 +60,31 @@ root.update()
 assert root.clipboard_get() == needle
 print("Ctrl+Insert copies too OK")
 
+# ---- an already-sent bubble can select and copy only part of its text ----
+bubble = view._inline_bubbles[0]
+sent_needle = "出檔案"
+sent_start = bubble.search(sent_needle, "1.0")
+assert sent_start, "fixture user message not found in its bubble"
+bubble.tag_add("sel", sent_start, f"{sent_start}+{len(sent_needle)}c")
+root.clipboard_clear(); root.update()
+bubble.focus_set(); root.update()
+bubble.event_generate("<Control-c>")
+root.update()
+assert root.clipboard_get() == sent_needle, repr(root.clipboard_get())
+view._copy_selected_or_block(bubble, "列出檔案清單")
+assert root.clipboard_get() == sent_needle
+print("sent-message bubbles copy only their selection OK")
+
 # ---- copying with nothing selected says so instead of clearing the clipboard ----
 text.tag_remove("sel", "1.0", "end")
 root.update()
 view.copy_selection()
-assert root.clipboard_get() == needle, "an empty copy must not wipe the clipboard"
+assert root.clipboard_get() == sent_needle, "an empty copy must not wipe the clipboard"
 assert "沒有選取" in app.status.cget("text"), app.status.cget("text")
 print("empty selection leaves the clipboard alone OK")
 
 # ---- Ctrl+A selects the whole transcript ----
-text.event_generate("<Control-a>")
+view.select_all()
 root.update()
 selected = view.selection()
 assert "列出檔案清單" in selected and "eic_server_edit" in selected, repr(selected[:120])
@@ -97,6 +112,15 @@ text.event_generate("<Control-Return>")
 root.update()
 assert sent == [(conv["id"], "從逐字稿送出")], sent
 print("Ctrl+Enter works from the transcript OK")
+
+# Windows uses Ctrl+Shift as a common IME-switch shortcut.  The composer must
+# not consume its modifier key presses, and modified Return must remain a
+# normal Text-widget action rather than send the conversation.
+assert view.input.bind("<Control-KeyPress-Shift_L>")
+assert view.input.bind("<Control-KeyPress-Shift_R>")
+assert view._pass_through_ime_shortcut(object()) is None
+assert view._on_input_return(type("Event", (), {"state": 0x0001})()) is None
+print("Ctrl+Shift IME shortcut and Shift+Enter both pass through OK")
 
 # ---- the right-click menu is wired up ----
 assert text.bind("<Button-3>"), "transcript needs a context menu"

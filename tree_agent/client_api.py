@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -667,12 +668,17 @@ class RemoteWorkspace:
     the service.
     """
 
+    REPLACE_ATTEMPTS = 8
+    REPLACE_BACKOFF = 0.03
+
     def __init__(self, client: WorkspaceClient, home: str) -> None:
         self.client = client
         self.home = home
         self.path = f"{client.base_url}/api/tree"
         self._prefs_path = os.path.join(home, "desktop.json")
+        self.last_local_save_error: OSError | None = None
         self._prefs = self._load_prefs()
+        self._execution = dict(self._prefs.get("execution") or {})
         self.data: dict[str, Any] = {
             "ui": dict(self._prefs.get("ui") or {}),
             "agents": dict(self._prefs.get("agents") or {}),
@@ -695,11 +701,27 @@ class RemoteWorkspace:
     def save(self) -> None:
         """Persist local-only desktop preferences, never the shared tree."""
         os.makedirs(self.home, exist_ok=True)
-        payload = {"ui": self.data.get("ui") or {}, "agents": self.data.get("agents") or {}}
+        payload = {
+            "ui": self.data.get("ui") or {},
+            "agents": self.data.get("agents") or {},
+            "execution": self._execution,
+        }
         temporary = self._prefs_path + ".tmp"
+        encoded = json.dumps(payload, ensure_ascii=False, indent=2)
         with open(temporary, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-        os.replace(temporary, self._prefs_path)
+            handle.write(encoded)
+        for attempt in range(self.REPLACE_ATTEMPTS):
+            try:
+                os.replace(temporary, self._prefs_path)
+                return
+            except PermissionError:
+                time.sleep(self.REPLACE_BACKOFF * (attempt + 1))
+        # Windows scanners and sync clients can hold desktop.json open.  A
+        # brief in-place write preserves the preference rather than surfacing a
+        # false save failure; the completed temporary file remains available if
+        # this final write is also interrupted.
+        with open(self._prefs_path, "w", encoding="utf-8") as handle:
+            handle.write(encoded)
 
     def touch(self) -> None:
         # The historical UI batches these calls.  There is no shared mutable
@@ -726,10 +748,23 @@ class RemoteWorkspace:
     def refresh(self) -> None:
         tree = self.client.tree()
         self.data["defaults"] = dict(tree.get("defaults") or {})
+        if self._execution.get("workspace_cwd"):
+            self.data["defaults"]["cwd"] = self._execution["workspace_cwd"]
+        if self._execution.get("workspace_agent") in (store.CODEX_AGENT, store.CLAUDE_AGENT):
+            self.data["defaults"]["agent_id"] = self._execution["workspace_agent"]
         self.data["projects"] = [self._normalise_project(project, None) for project in tree["projects"]]
 
     def _normalise_project(self, raw: dict[str, Any], parent: dict[str, Any] | None) -> dict[str, Any]:
         node = dict(raw)
+        local = self._project_execution(node["id"])
+        # CLI runners operate on this computer, so these choices intentionally
+        # live in desktop.json rather than in the shared service record.
+        if "cwd" in local:
+            node["cwd"] = local["cwd"]
+        if "default_agent" in local:
+            node["default_agent"] = local["default_agent"]
+        else:
+            node["default_agent"] = None
         node["kind"] = store.PROJECT
         node["children"] = []
         self._parents[node["id"]] = parent
@@ -820,7 +855,18 @@ class RemoteWorkspace:
         return self.client.path_of(node_id)
 
     def resolve(self, node_id: str) -> dict[str, Any]:
-        return self.client.settings_for(node_id)
+        resolved = self.client.settings_for(node_id)
+        node = self.find(node_id)
+        chain = ([node] if node else []) + self.ancestors(node_id)
+        for candidate in chain:
+            if candidate and candidate.get("kind") == store.PROJECT and candidate.get("cwd"):
+                resolved["cwd"] = candidate["cwd"]
+                break
+        workspace_cwd = self._execution.get("workspace_cwd")
+        if not any(candidate and candidate.get("kind") == store.PROJECT and candidate.get("cwd") for candidate in chain):
+            if isinstance(workspace_cwd, str) and workspace_cwd:
+                resolved["cwd"] = workspace_cwd
+        return resolved
 
     def instructions_for(self, node_id: str, include_self: bool = True) -> str:
         return self.client.instructions_for(node_id) if include_self else ""
@@ -846,7 +892,22 @@ class RemoteWorkspace:
         return self.find(created["id"]) or created
 
     def add_conversation(self, project_id: str, name: str) -> dict[str, Any]:
-        created = self.client.create_conversation(project_id=project_id, name=name)
+        # The server retains an effective runner for compatibility with older
+        # clients; this desktop records that a new conversation inherits.
+        created = self.client.create_conversation(
+            project_id=project_id, name=name,
+            agent_id=self.project_agent(project_id),
+        )
+        self._conversation_agents()[created["id"]] = None
+        # The server has already created the conversation.  Losing access to
+        # this machine's optional desktop preferences must not make the UI
+        # look as if the button did nothing.
+        try:
+            self.save()
+        except OSError as exc:
+            self.last_local_save_error = exc
+        else:
+            self.last_local_save_error = None
         self.refresh()
         return self.find(created["id"]) or created
 
@@ -887,6 +948,15 @@ class RemoteWorkspace:
         node = self.find(node_id)
         if not node or node["kind"] != store.PROJECT:
             return
+        if key in ("cwd", "default_agent"):
+            local = self._project_execution(node_id)
+            if value:
+                local[key] = value
+            else:
+                local.pop(key, None)
+            self.save()
+            node[key] = value or None
+            return
         updated = self.client.update_project(node_id, revision=node["revision"], **{key: value or None})
         node.update(updated)
 
@@ -898,13 +968,85 @@ class RemoteWorkspace:
 
     def conversation_agent(self, conv_id: str) -> str:
         node = self.find(conv_id)
+        overrides = self._conversation_agents()
+        if conv_id in overrides:
+            selected = overrides[conv_id]
+            if selected in (store.CODEX_AGENT, store.CLAUDE_AGENT):
+                return selected
+            return self.project_agent(conv_id)
+        # Existing conversations keep their former explicit server choice.
         return (node or {}).get("agent_id") or store.DEFAULT_AGENT
 
-    def set_conversation_agent(self, conv_id: str, agent_id: str) -> None:
+    def conversation_agent_source(self, conv_id: str) -> str:
+        if self._conversation_agents().get(conv_id) in (store.CODEX_AGENT, store.CLAUDE_AGENT):
+            return "對話"
+        if conv_id not in self._conversation_agents():
+            return "對話"
+        project = self.owning_project(conv_id)
+        for candidate in ([project] if project else []) + self.ancestors(project["id"] if project else conv_id):
+            if candidate and candidate.get("default_agent") in (store.CODEX_AGENT, store.CLAUDE_AGENT):
+                return "專案"
+        return "工作區" if self._execution.get("workspace_agent") in (store.CODEX_AGENT, store.CLAUDE_AGENT) else "Codex CLI"
+
+    def project_agent(self, node_id: str) -> str:
+        project = self.owning_project(node_id)
+        chain = ([project] if project else []) + self.ancestors(project["id"] if project else node_id)
+        for candidate in chain:
+            if candidate and candidate.get("default_agent") in (store.CODEX_AGENT, store.CLAUDE_AGENT):
+                return candidate["default_agent"]
+        selected = self._execution.get("workspace_agent")
+        return selected if selected in (store.CODEX_AGENT, store.CLAUDE_AGENT) else store.DEFAULT_AGENT
+
+    def set_conversation_agent(self, conv_id: str, agent_id: str | None) -> None:
         node = self.find(conv_id)
-        if node:
-            updated = self.client.update_conversation(conv_id, revision=node["revision"], agent_id=agent_id)
-            node.update(updated)
+        if node and (agent_id is None or agent_id in (store.CODEX_AGENT, store.CLAUDE_AGENT)):
+            self._conversation_agents()[conv_id] = agent_id
+            self.save()
+
+    def set_workspace_default(self, key: str, value: Any) -> None:
+        if key == "cwd":
+            key = "workspace_cwd"
+        if key not in ("workspace_cwd", "workspace_agent"):
+            raise ValueError("未知的本機工作區設定")
+        if value:
+            self._execution[key] = value
+        else:
+            self._execution.pop(key, None)
+        self.save()
+
+    def _project_execution(self, project_id: str) -> dict[str, Any]:
+        projects = self._execution.setdefault("projects", {})
+        return projects.setdefault(project_id, {})
+
+    def _conversation_agents(self) -> dict[str, Any]:
+        return self._execution.setdefault("conversation_agents", {})
+
+    def start_execution_record(self, conv_id: str, record: dict[str, Any]) -> str:
+        record = dict(record)
+        record_id = str(record.get("id") or new_key())
+        record["id"] = record_id
+        record.setdefault("tools", [])
+        self._execution.setdefault("records", {}).setdefault(conv_id, []).append(record)
+        self.save()
+        return record_id
+
+    def execution_records(self, conv_id: str) -> list[dict[str, Any]]:
+        records = self._execution.get("records", {}).get(conv_id, [])
+        return [dict(record) for record in records if isinstance(record, dict)]
+
+    def update_execution_record(self, conv_id: str, record_id: str, **fields: Any) -> None:
+        for record in self._execution.get("records", {}).get(conv_id, []):
+            if record.get("id") == record_id:
+                record.update(fields)
+                self.save()
+                return
+
+    def add_execution_tool(self, conv_id: str, record_id: str, summary: str) -> None:
+        for record in self._execution.get("records", {}).get(conv_id, []):
+            if record.get("id") == record_id:
+                record.setdefault("tools", []).append(summary)
+                self.save()
+                return
 
     def agent_path(self, agent_id: str) -> str | None:
         value = (self.agents.get(agent_id) or {}).get("path")

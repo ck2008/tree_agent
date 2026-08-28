@@ -14,12 +14,13 @@ from __future__ import annotations
 import os
 import queue
 import re
+import shutil
 import subprocess
 import time
 import sys
 import hashlib
 import tkinter as tk
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, font as tkfont, messagebox, simpledialog, ttk
 from typing import Any
 from urllib.parse import quote, unquote, urlparse
 
@@ -31,12 +32,12 @@ except ImportError:  # Keep the main UI usable if optional drag support is absen
 
 if __package__ in (None, ""):  # allow `python app.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from tree_agent import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
+    from tree_agent import clipboard_image, codex_runner, git_worktree, pdf_support, richtext, store, transfer
     from tree_agent.client_api import ApiError, RemoteWorkspace, WorkspaceClient
     from tree_agent.preferences import DesktopPreferences
     from tree_agent.session_store import SessionStore
 else:
-    from . import clipboard_image, codex_runner, pdf_support, richtext, store, transfer
+    from . import clipboard_image, codex_runner, git_worktree, pdf_support, richtext, store, transfer
     from .client_api import ApiError, RemoteWorkspace, WorkspaceClient
     from .preferences import DesktopPreferences
     from .session_store import SessionStore
@@ -201,6 +202,140 @@ class EmailVerificationDialog(tk.Toplevel):
         if self.skip_future.get():
             self.preferences.set_email_verification_prompt_suppressed(True)
         self.destroy()
+
+
+class ChangeReviewDialog(tk.Toplevel):
+    """Review one local Git worktree without ever invoking a shell."""
+
+    def __init__(self, parent: tk.Misc, cwd: str) -> None:
+        super().__init__(parent)
+        self.repo = git_worktree.repository_root(cwd)
+        self.title("變更檢視與套用")
+        self.geometry("960x620")
+        self.minsize(720, 440)
+        self.transient(parent)
+        self.changes: list[git_worktree.GitChange] = []
+
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(1, weight=1)
+        self.location = ttk.Label(body, text=self.repo or "找不到 Git 儲存庫", style="Muted.TLabel")
+        self.location.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        self.files = tk.Listbox(body, exportselection=False, width=32)
+        self.files.grid(row=1, column=0, sticky="nsew", padx=(0, 10))
+        self.files.bind("<<ListboxSelect>>", self._show_diff)
+        diff_holder = tk.Frame(body, bg=COLORS["border"])
+        diff_holder.grid(row=1, column=1, sticky="nsew")
+        diff_holder.rowconfigure(0, weight=1)
+        diff_holder.columnconfigure(0, weight=1)
+        self.diff_text = tk.Text(
+            diff_holder, wrap="none", bd=0, padx=10, pady=8,
+            bg=COLORS["panel"], fg=COLORS["text"], font=(MONO_FONT, 9), state="disabled",
+        )
+        self.diff_text.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+        ybar = ttk.Scrollbar(diff_holder, orient="vertical", command=self.diff_text.yview)
+        ybar.grid(row=0, column=1, sticky="ns", pady=1)
+        xbar = ttk.Scrollbar(diff_holder, orient="horizontal", command=self.diff_text.xview)
+        xbar.grid(row=1, column=0, sticky="ew", padx=1)
+        self.diff_text.configure(yscrollcommand=ybar.set, xscrollcommand=xbar.set)
+        actions = ttk.Frame(body)
+        actions.grid(row=2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(actions, text="重新整理", command=self.refresh).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="還原選取檔案", command=self.restore_selected).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="全部還原…", command=self.restore_all).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="Commit…", command=self.commit).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="保留變更", command=self.destroy).pack(side="left")
+        self.refresh()
+        self.grab_set()
+
+    def refresh(self) -> None:
+        self.files.delete(0, "end")
+        self.changes = []
+        if self.repo is None:
+            self._set_diff("此專案尚未綁定 Git 儲存庫。")
+            return
+        try:
+            self.changes = git_worktree.changes(self.repo)
+        except git_worktree.GitError as exc:
+            self._set_diff(str(exc))
+            return
+        if not self.changes:
+            self._set_diff("目前沒有未提交的變更。")
+            return
+        for change in self.changes:
+            marker = "??" if change.untracked else change.index_status + change.worktree_status
+            self.files.insert("end", f"{marker}  {change.path}")
+        self.files.selection_set(0)
+        self._show_diff()
+
+    def _selected(self) -> git_worktree.GitChange | None:
+        selected = self.files.curselection()
+        return self.changes[selected[0]] if selected else None
+
+    def _show_diff(self, _event=None) -> None:
+        change = self._selected()
+        if change is None or self.repo is None:
+            return
+        if change.untracked:
+            self._set_diff("未追蹤的新檔案；尚未有可比較的 Git diff。")
+            return
+        try:
+            text = git_worktree.diff(self.repo, change.path) or "（Git 未回傳可顯示的 diff）"
+        except git_worktree.GitError as exc:
+            text = str(exc)
+        self._set_diff(text)
+
+    def _set_diff(self, text: str) -> None:
+        self.diff_text.configure(state="normal")
+        self.diff_text.delete("1.0", "end")
+        self.diff_text.insert("1.0", text)
+        self.diff_text.configure(state="disabled")
+
+    def restore_selected(self) -> None:
+        change = self._selected()
+        if change is None or self.repo is None:
+            return
+        if change.untracked:
+            if not messagebox.askyesno(APP_NAME, f"刪除未追蹤檔案？\n\n{change.path}", parent=self):
+                return
+            action = lambda: git_worktree.remove_untracked(self.repo or "", [change.path])
+        else:
+            if not messagebox.askyesno(APP_NAME, f"還原這個檔案的未提交變更？\n\n{change.path}", parent=self):
+                return
+            action = lambda: git_worktree.restore_tracked(self.repo or "", [change.path])
+        self._run_action(action)
+
+    def restore_all(self) -> None:
+        if self.repo is None or not self.changes:
+            return
+        tracked = [change.path for change in self.changes if not change.untracked]
+        untracked = [change.path for change in self.changes if change.untracked]
+        message = "還原所有已追蹤檔案的未提交變更？"
+        if untracked:
+            message += f"\n\n另有 {len(untracked)} 個未追蹤檔案；不會自動刪除。"
+        if not messagebox.askyesno(APP_NAME, message, parent=self):
+            return
+        self._run_action(lambda: git_worktree.restore_tracked(self.repo or "", tracked))
+
+    def commit(self) -> None:
+        if self.repo is None or not self.changes:
+            return
+        message = simpledialog.askstring("Commit", "Commit 訊息：", parent=self)
+        if message is None:
+            return
+        self._run_action(lambda: git_worktree.commit_all(self.repo or "", message), close_on_success=True)
+
+    def _run_action(self, action, *, close_on_success: bool = False) -> None:
+        try:
+            action()
+        except git_worktree.GitError as exc:
+            messagebox.showerror(APP_NAME, str(exc), parent=self)
+            return
+        if close_on_success:
+            self.destroy()
+        else:
+            self.refresh()
 
 
 class LoginDialog(tk.Toplevel):
@@ -562,10 +697,11 @@ AGENT_LABELS = {
     store.CODEX_AGENT: "Codex CLI",
     store.CLAUDE_AGENT: "Claude Code",
 }
+INHERIT_AGENT = "（使用專案預設）"
 
 PUMP_INTERVAL_MS = 60          # how often worker-thread events reach the UI
 FLUSH_EVERY_TICKS = 8         # coalesce streamed message writes (~0.5s)
-THUMBNAIL_HEIGHT = 48         # attachment preview height, in pixels
+THUMBNAIL_HEIGHT = 96         # attachment preview height, in pixels
 # Stand-in prompt when you attach images without typing anything.
 IMAGE_ONLY_PROMPT = "請看附加的圖片。"
 PDF_ONLY_PROMPT = "請分析附加的 PDF。"
@@ -686,6 +822,7 @@ class TreeAgentApp:
         self.turn_serials: dict[str, int] = {}
         self.turn_started: dict[str, float] = {}
         self.turn_stage: dict[str, str] = {}
+        self.turn_records: dict[str, str] = {}
         self._turn_counter = 0
         self.events: queue.Queue[tuple[str, int, dict[str, Any]]] = queue.Queue()
         self.current_id: str | None = None
@@ -844,6 +981,7 @@ class TreeAgentApp:
         edit_menu.add_separator()
         edit_menu.add_command(label="複製對話內容", command=self.copy_transcript)
         edit_menu.add_command(label="從這裡分岔出新對話", command=self.fork_conversation)
+        edit_menu.add_command(label="變更檢視與套用…", command=self.review_worktree_changes)
         edit_menu.add_command(label="審查未提交的變更", command=self.review_changes)
         edit_menu.add_command(label="重設對話（清空並開新 thread）", command=self.reset_conversation)
         menubar.add_cascade(label="編輯", menu=edit_menu)
@@ -1371,7 +1509,16 @@ class TreeAgentApp:
         )
         if not name:
             return
+        inherited = self.ws.resolve(parent_id)["cwd"] if parent_id else self.ws.defaults.get("cwd")
+        cwd = filedialog.askdirectory(
+            parent=self.root,
+            title=f"選擇「{name.strip()}」的本機工作目錄",
+            initialdir=inherited or None,
+        )
+        if not cwd:
+            return
         node = self.ws.add_project(parent_id, name.strip())
+        self.ws.set_option(node["id"], "cwd", os.path.normpath(cwd))
         self._reveal_new(node["id"])
 
     def new_conversation(self) -> None:
@@ -1387,7 +1534,11 @@ class TreeAgentApp:
         )
         self._reveal_new(node["id"])
         self.conv_view.focus_input()
-        self.set_status(f"已在「{project['name']}」新增「{node['name']}」· F2 可改名")
+        status = f"已在「{project['name']}」新增「{node['name']}」· F2 可改名"
+        local_save_error = getattr(self.ws, "last_local_save_error", None)
+        if local_save_error is not None:
+            status += f"（本機偏好設定未儲存：{local_save_error}）"
+        self.set_status(status)
 
     def _reveal_new(self, node_id: str) -> None:
         """Select a freshly created node, lifting any search filter hiding it."""
@@ -1755,14 +1906,6 @@ class TreeAgentApp:
         _open_in_explorer(self.ws.home)
 
     def edit_defaults(self) -> None:
-        if isinstance(self.ws, RemoteWorkspace):
-            messagebox.showinfo(
-                APP_NAME,
-                "共用服務的預設值由服務主機設定。請在服務設定中調整；"
-                "個別專案設定仍可在右側面板修改。",
-                parent=self.root,
-            )
-            return
         DefaultsDialog(self.root, self)
 
     def edit_agents(self) -> None:
@@ -1811,6 +1954,18 @@ class TreeAgentApp:
             "審查未提交的變更（codex exec review --uncommitted）",
             review=codex_runner.REVIEW_UNCOMMITTED,
         )
+
+    def review_worktree_changes(self) -> None:
+        """Open safe local Git actions for the selected project's worktree."""
+        project = self.ws.owning_project(self.selected_id())
+        if project is None:
+            messagebox.showinfo(APP_NAME, "請先選一個專案或它底下的對話。", parent=self.root)
+            return
+        cwd = self.ws.resolve(project["id"]).get("cwd")
+        if not cwd:
+            messagebox.showwarning(APP_NAME, "此專案尚未設定本機工作目錄。", parent=self.root)
+            return
+        ChangeReviewDialog(self.root, cwd)
 
     def send(
         self,
@@ -1913,6 +2068,17 @@ class TreeAgentApp:
             self.set_status(
                 f"執行中（{AGENT_LABELS[agent_id]} · {mode}）· cwd={settings['cwd']}"
             )
+        record_id = self.ws.start_execution_record(conv_id, {
+            "agent_id": agent_id,
+            "cwd": settings["cwd"],
+            "mode": mode,
+            "started_at": time.time(),
+            "status": "running",
+        })
+        if record_id:
+            self.turn_records[conv_id] = record_id
+            if conv_id == self.current_id:
+                self.conv_view.refresh_info()
         turn.start()
 
     def _prepare_attachments(self, paths: list[str], *, page_limit: int = PDF_PAGE_LIMIT) -> dict[str, Any]:
@@ -2048,6 +2214,11 @@ class TreeAgentApp:
         self.turn_serials.pop(conv_id, None)
         self.turn_started.pop(conv_id, None)
         self.turn_stage.pop(conv_id, None)
+        record_id = self.turn_records.pop(conv_id, None)
+        if record_id:
+            self.ws.update_execution_record(
+                conv_id, record_id, status="cancelled", completed_at=time.time(),
+            )
 
     def running_progress(self, conv_id: str) -> str:
         """"執行中 12s · 執行指令", or "" when this conversation is idle."""
@@ -2123,6 +2294,11 @@ class TreeAgentApp:
             self.turn_stage[conv_id] = {"tool": "tool", "agent": "writing",
                                         "reasoning": "thinking"}.get(role, "thinking")
             agent_id = self.ws.conversation_agent(conv_id)
+            if role == "tool":
+                record_id = self.turn_records.get(conv_id)
+                if record_id:
+                    summary = (text or "工具").strip().splitlines()[0][:160]
+                    self.ws.add_execution_tool(conv_id, record_id, summary)
             # Claude's stream emits one terse event per tool call. Keep those
             # events for auditability, but reserve the transcript for the
             # actual answer; the info rail has a dedicated scrollable log.
@@ -2155,6 +2331,16 @@ class TreeAgentApp:
             if visible:
                 self.conv_view.append_log(text)
         elif kind == "done":
+            started = self.turn_started.get(conv_id)
+            record_id = self.turn_records.pop(conv_id, None)
+            if record_id:
+                rc = event.get("returncode")
+                status = "cancelled" if event.get("cancelled") else ("failed" if rc not in (0, None) else "completed")
+                self.ws.update_execution_record(
+                    conv_id, record_id, status=status, returncode=rc,
+                    completed_at=time.time(),
+                    duration_seconds=round(time.monotonic() - started, 1) if started else None,
+                )
             self.turns.pop(conv_id, None)
             self.turn_serials.pop(conv_id, None)
             self.turn_started.pop(conv_id, None)
@@ -2163,6 +2349,8 @@ class TreeAgentApp:
             started_next = self.conv_view.start_next_queued(conv_id)
             if visible and not started_next:
                 self.conv_view.set_running(False)
+            if visible:
+                self.conv_view.refresh_info()
             rc = event.get("returncode")
             if event.get("cancelled"):
                 self.ws.append_message(conv_id, "meta", "（已停止）")
@@ -2283,7 +2471,7 @@ class ConversationView(ttk.Frame):
         self.agent_var = tk.StringVar(value=AGENT_LABELS[store.CODEX_AGENT])
         self.agent_picker = ttk.Combobox(
             buttons, textvariable=self.agent_var, state="readonly", width=13,
-            values=tuple(AGENT_LABELS.values()),
+            values=(INHERIT_AGENT,) + tuple(AGENT_LABELS.values()),
         )
         self.agent_picker.pack(side="left", padx=(0, 8))
         self.agent_picker.bind("<<ComboboxSelected>>", self._on_agent_changed)
@@ -2390,8 +2578,15 @@ class ConversationView(ttk.Frame):
             undo=True,
         )
         self.input.pack(fill="both", expand=True, padx=1, pady=1)
-        self.input.bind("<Return>", self._on_send_key)
-        self.input.bind("<Shift-Return>", lambda e: None)  # let Text insert a newline
+        # Do not bind the modifier-only part of Ctrl+Shift.  On Windows this is
+        # commonly the IME toggle, and it must be allowed to reach the system
+        # while the composer owns the focus.
+        for sequence in (
+            "<Control-KeyPress-Shift_L>", "<Control-KeyPress-Shift_R>",
+            "<Shift-KeyPress-Control_L>", "<Shift-KeyPress-Control_R>",
+        ):
+            self.input.bind(sequence, self._pass_through_ime_shortcut, add="+")
+        self.input.bind("<Return>", self._on_input_return)
         self.input.bind("<KeyRelease>", lambda e: self._refresh_send_state())
         self._register_file_drop()
 
@@ -2615,7 +2810,18 @@ class ConversationView(ttk.Frame):
         """Put a transcript position at the top of the view."""
         self.text.see(index)
         self.text.yview(index)
+        # Embedded bubbles/cards finish their geometry on idle. Align once more
+        # after that pass or an outline click near the first message can stop a
+        # couple of display lines below its intended heading.
+        self.after_idle(lambda: self._align_jump(index))
         self._update_jump_button()
+
+    def _align_jump(self, index: str) -> None:
+        try:
+            self.text.yview(index)
+            self._update_jump_button()
+        except tk.TclError:
+            pass
 
     def refresh_info(self) -> None:
         for child in self.info_body.winfo_children():
@@ -2655,6 +2861,35 @@ class ConversationView(ttk.Frame):
             tk.Label(self.info_body, text=value, bg=COLORS["sidebar"], fg=COLORS["text"],
                      font=(self.app.mono_font, 8), anchor="w", justify="left",
                      wraplength=INFO_WIDTH - 16).pack(anchor="w", pady=(0, 6))
+
+        records = self.app.ws.execution_records(conv["id"])
+        if records:
+            ttk.Label(self.info_body, text=f"Agent 執行紀錄（{len(records)}）",
+                      style="Muted.TLabel").pack(anchor="w", pady=(8, 2))
+            for record in reversed(records[-12:]):
+                status = {
+                    "running": "執行中", "completed": "完成",
+                    "failed": "失敗", "cancelled": "已停止",
+                }.get(record.get("status"), "未知")
+                elapsed = record.get("duration_seconds")
+                duration = f" · {elapsed:g}s" if isinstance(elapsed, (int, float)) else ""
+                agent = AGENT_LABELS.get(record.get("agent_id"), "Agent")
+                holder = tk.Frame(self.info_body, bg=COLORS["panel"], highlightthickness=1,
+                                  highlightbackground=COLORS["border"])
+                holder.pack(fill="x", pady=(0, 5))
+                tk.Label(holder, text=f"{agent} · {status}{duration}", bg=COLORS["panel"],
+                         fg=COLORS["text"], font=(self.app.ui_font, 8, "bold"),
+                         anchor="w", padx=6, pady=3).pack(fill="x")
+                tk.Label(holder, text=f"{record.get('mode', 'turn')}\n{record.get('cwd', '')}",
+                         bg=COLORS["panel"], fg=COLORS["muted"], font=(self.app.mono_font, 7),
+                         anchor="w", justify="left", wraplength=INFO_WIDTH - 30,
+                         padx=6, pady=3).pack(fill="x")
+                tools = record.get("tools") or []
+                if tools:
+                    tk.Label(holder, text="工具：" + "、".join(str(tool) for tool in tools[-3:]),
+                             bg=COLORS["panel"], fg=COLORS["tool"], font=(self.app.mono_font, 7),
+                             anchor="w", justify="left", wraplength=INFO_WIDTH - 30,
+                             padx=6, pady=4).pack(fill="x")
 
         images = [p for m in conv["messages"] for p in (m.get("images") or ())]
         if images:
@@ -2708,7 +2943,10 @@ class ConversationView(ttk.Frame):
             log.grid(row=0, column=0, sticky="ew", padx=(1, 0), pady=1)
             bar.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
             for index, event in enumerate(tool_events, start=1):
-                log.insert("end", f"{index}. {event}\n")
+                # Commands and outputs can contain secrets and make the rail
+                # unreadable. Keep a compact audit summary here instead.
+                summary = (event or "工具").strip().splitlines()[0][:180]
+                log.insert("end", f"{index}. {summary}\n")
             log.configure(state="disabled")
 
     def _bind_transcript(self) -> None:
@@ -3022,8 +3260,8 @@ class ConversationView(ttk.Frame):
         self._inline_images: list[tk.PhotoImage] = []
         self._inline_log_widgets: list[tk.Frame] = []
         self._inline_code_widgets: list[tk.Frame] = []
-        self._inline_code_labels: list[tk.Label] = []
-        self._inline_bubbles: list[tk.Label] = []
+        self._inline_code_labels: list[tk.Text] = []
+        self._inline_bubbles: list[tk.Text] = []
         self._user_entries: list[tuple[str, str]] = []
         self._link_targets: dict[str, str] = {}
         self._tool_blocks: list[tuple[str, str, str]] = []
@@ -3075,7 +3313,11 @@ class ConversationView(ttk.Frame):
         self.title_label.configure(text=self.app.ws.path_of(conv["id"]))
         settings = self.app.ws.resolve(conv["id"])
         agent_id = self.app.ws.conversation_agent(conv["id"])
-        self.agent_var.set(AGENT_LABELS[agent_id])
+        self.agent_var.set(
+            AGENT_LABELS[agent_id]
+            if self.app.ws.conversation_agent_source(conv["id"]) == "對話"
+            else INHERIT_AGENT
+        )
         if agent_id == store.CLAUDE_AGENT:
             thread = conv.get("claude_session_id") or "尚未建立"
         elif conv.get("thread_id"):
@@ -3084,8 +3326,8 @@ class ConversationView(ttk.Frame):
             thread = f"送出後才建立（將分岔自 {conv['fork_of']}）"
         else:
             thread = "尚未建立"
-        meta = "Agent: {}    cwd: {}    模型: {}    sandbox: {}    session: {}".format(
-            AGENT_LABELS[agent_id],
+        meta = "Agent: {}（{}）    cwd: {}    模型: {}    sandbox: {}    session: {}".format(
+            AGENT_LABELS[agent_id], self.app.ws.conversation_agent_source(conv["id"]),
             settings["cwd"], settings.get("model") or "(config 預設)",
             settings.get("sandbox"), thread,
         )
@@ -3104,14 +3346,17 @@ class ConversationView(ttk.Frame):
     def _on_agent_changed(self, _event=None) -> None:
         if not self.conv_id:
             return
-        agent_id = next((key for key, label in AGENT_LABELS.items() if label == self.agent_var.get()), store.CODEX_AGENT)
+        agent_id = next((key for key, label in AGENT_LABELS.items() if label == self.agent_var.get()), None)
         if self.conv_id in self.app.turns:
             self.refresh_header()
             self.app.set_status("Agent 執行中，完成後才能切換。")
             return
         self.app.ws.set_conversation_agent(self.conv_id, agent_id)
         self.refresh_header()
-        self.app.set_status(f"此對話已改用 {AGENT_LABELS[agent_id]}")
+        self.app.set_status(
+            f"此對話已改用 {AGENT_LABELS[agent_id]}"
+            if agent_id else "此對話已改用專案／工作區預設 Agent"
+        )
 
     def append(self, role: str, text: str, images: list[str] | None = None,
                agent_id: str | None = None) -> None:
@@ -3195,15 +3440,38 @@ class ConversationView(ttk.Frame):
         that still takes a click.
         """
         bubble = tk.Frame(self.text, bg=COLORS["user_bg"], bd=0, highlightthickness=0)
-        body = tk.Label(
-            bubble, text=text, bg=COLORS["user_bg"], fg=COLORS["text"],
-            font=(self.app.ui_font, 10), justify="left", anchor="w",
-            padx=12, pady=8, wraplength=self._bubble_wraplength(),
+        body = tk.Text(
+            bubble, wrap="word", bd=0, highlightthickness=0,
+            bg=COLORS["user_bg"], fg=COLORS["text"], insertbackground=COLORS["text"],
+            font=(self.app.ui_font, 10), padx=12, pady=8, cursor="xterm",
+            selectbackground=COLORS["select"], selectforeground=COLORS["text"],
+            takefocus=1,
         )
+        body.insert("1.0", text)
+        body.configure(state="disabled")
+        # Tk embeds a window at its requested width.  Cap the initial request
+        # so a bubble created while the window is wide still remains compact
+        # after the user narrows the transcript.
+        initial_wrap = min(260, self._bubble_wraplength())
+        initial_char_width = max(1, tkfont.Font(font=body.cget("font")).measure("0"))
+        initial_columns = max(24, (initial_wrap - 24) // initial_char_width)
+        initial_lines = sum(
+            max(1, (len(line.expandtabs(4)) + initial_columns - 1) // initial_columns)
+            for line in text.split("\n")
+        )
+        body.configure(width=initial_columns, height=max(1, initial_lines))
         body.pack(fill="both", expand=True)
-        # A Label is not selectable, so the message stays reachable by menu.
-        for widget in (bubble, body):
-            widget.bind("<Button-3>", lambda event, value=text: self._bubble_menu(event, value))
+        bubble.pack_propagate(False)
+        body.update_idletasks()
+        bubble.configure(width=initial_wrap, height=body.winfo_reqheight())
+        body.bind("<Button-1>", lambda _event, widget=body: widget.focus_set(), add="+")
+        for sequence in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            body.bind(sequence, lambda event, widget=body: self._copy_widget_selection(widget, event))
+        body.bind("<<Copy>>", lambda event, widget=body: self._copy_widget_selection(widget, event))
+        for sequence in ("<Control-a>", "<Control-A>"):
+            body.bind(sequence, lambda event, widget=body: self._select_widget_all(widget, event))
+        bubble.bind("<Button-3>", lambda event, value=text: self._bubble_menu(event, value))
+        body.bind("<Button-3>", lambda event, value=text, widget=body: self._bubble_menu(event, value, widget))
         self._bind_block_mousewheel(bubble)
         self._inline_bubbles.append(body)
         start = self.text.index("end-1c")
@@ -3227,10 +3495,10 @@ class ConversationView(ttk.Frame):
         value-for-value palette swap cannot tell which role a bubble meant and
         picks the wrong Dark+ layer. Setting it from the palette is exact.
         """
-        for label in getattr(self, "_inline_bubbles", ()):
-            if label.winfo_exists():
-                label.configure(bg=COLORS["user_bg"], fg=COLORS["text"])
-                parent = label.master
+        for body in getattr(self, "_inline_bubbles", ()):
+            if body.winfo_exists():
+                body.configure(bg=COLORS["user_bg"], fg=COLORS["text"])
+                parent = body.master
                 if parent.winfo_exists():
                     parent.configure(bg=COLORS["user_bg"])
 
@@ -3250,9 +3518,9 @@ class ConversationView(ttk.Frame):
         """Pixels a bubble may fill before wrapping — never the whole measure."""
         return max(200, int(self._content_px() * BUBBLE_MAX_RATIO))
 
-    def _bubble_menu(self, event, text: str) -> None:
+    def _bubble_menu(self, event, text: str, widget: tk.Text | None = None) -> None:
         menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label="複製這則訊息", command=lambda: self._copy_block(text))
+        menu.add_command(label="複製這則訊息", command=lambda: self._copy_selected_or_block(widget, text))
         menu.add_separator()
         menu.add_command(label="複製整段對話", command=self.app.copy_transcript)
         try:
@@ -3338,11 +3606,21 @@ class ConversationView(ttk.Frame):
             font=(self.app.ui_font, 8), cursor="hand2",
         ).grid(row=0, column=1, padx=(0, 3), pady=2, sticky="w")
         header.grid(row=0, column=0, sticky="ew", padx=1, pady=(1, 0))
-        code = tk.Label(
-            frame, text=content, bg=COLORS["tool_bg"], fg=COLORS["tool"],
-            font=(self.app.mono_font, 9), justify="left", anchor="nw", padx=8, pady=7,
+        code = tk.Text(
+            frame, wrap="word", bd=0, padx=8, pady=7,
+            bg=COLORS["tool_bg"], fg=COLORS["tool"], insertbackground=COLORS["tool"],
+            font=(self.app.mono_font, 9), cursor="xterm",
+            selectbackground=COLORS["select"], selectforeground=COLORS["text"],
+            takefocus=1,
         )
         code.grid(row=1, column=0, sticky="ew", padx=1, pady=(0, 1))
+        code.insert("1.0", content)
+        code.configure(state="disabled")
+        code.bind("<Button-1>", lambda _event, widget=code: widget.focus_set(), add="+")
+        for sequence in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            code.bind(sequence, lambda event, widget=code: self._copy_widget_selection(widget, event))
+        for sequence in ("<Control-a>", "<Control-A>"):
+            code.bind(sequence, lambda event, widget=code: self._select_widget_all(widget, event))
         frame.grid_propagate(False)
         self._inline_code_widgets.append(frame)
         self._inline_code_labels.append(code)
@@ -3356,6 +3634,27 @@ class ConversationView(ttk.Frame):
         self.clipboard_append(content)
         self.update()
         self.app.set_status("已複製區塊內容")
+
+    def _copy_widget_selection(self, widget: tk.Text, _event=None) -> str:
+        """Copy a selection made inside an embedded, read-only code card."""
+        try:
+            selected = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = ""
+        if selected:
+            self.clipboard_clear()
+            self.clipboard_append(selected)
+            self.app.set_status(f"已複製 {len(selected)} 個字元")
+        else:
+            self.app.set_status("沒有選取任何程式碼")
+        return "break"
+
+    @staticmethod
+    def _select_widget_all(widget: tk.Text, _event=None) -> str:
+        widget.tag_remove("sel", "1.0", "end")
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.focus_set()
+        return "break"
 
     def _bind_block_mousewheel(self, widget: tk.Misc) -> None:
         """Let a code card pass wheel input through to the transcript."""
@@ -3379,10 +3678,18 @@ class ConversationView(ttk.Frame):
 
     def _resize_inline_blocks(self, _event=None) -> None:
         """Re-measure every embedded block against the transcript's width."""
-        wraplength = self._bubble_wraplength()
-        for label in getattr(self, "_inline_bubbles", ()):
-            if label.winfo_exists():
-                label.configure(wraplength=wraplength)
+        wraplength = min(260, self._bubble_wraplength())
+        for body in getattr(self, "_inline_bubbles", ()):
+            if body.winfo_exists():
+                char_width = max(1, tkfont.Font(font=body.cget("font")).measure("0"))
+                columns = max(24, (wraplength - 24) // char_width)
+                visual_lines = sum(
+                    max(1, (len(line.expandtabs(4)) + columns - 1) // columns)
+                    for line in body.get("1.0", "end-1c").split("\n")
+                )
+                body.configure(width=columns, height=max(1, visual_lines))
+                body.update_idletasks()
+                body.master.configure(width=wraplength, height=body.winfo_reqheight())
         # Fill the measure rather than shrink-wrapping the code, but stop at the
         # measure: sized to the pane instead, a card ran past the right inset on
         # a wide window and was clipped there.
@@ -3397,7 +3704,13 @@ class ConversationView(ttk.Frame):
             if not frame.winfo_exists():
                 continue
             frame.configure(width=width)
-            code.configure(wraplength=max(200, width - 18))
+            char_width = max(1, tkfont.Font(font=(self.app.mono_font, 9)).measure("0"))
+            columns = max(24, (width - 16) // char_width)
+            visual_lines = sum(
+                max(1, (len(line.expandtabs(4)) + columns - 1) // columns)
+                for line in code.get("1.0", "end-1c").split("\n")
+            )
+            code.configure(width=columns, height=max(1, visual_lines))
             frame.update_idletasks()
             header = frame.winfo_children()[0]
             frame.configure(height=header.winfo_reqheight() + code.winfo_reqheight() + 2)
@@ -3421,7 +3734,11 @@ class ConversationView(ttk.Frame):
         tag = f"imgopen{len(self._link_targets)}"
         self._link_targets[tag] = path
         self.text.tag_configure(tag, foreground=COLORS["accent"], underline=True)
-        self.text.tag_bind(tag, "<Button-1>", lambda e, t=tag: self._file_link_menu(e, self._link_targets[t]))
+        # Attachments should behave like files in Explorer: left-click opens
+        # them immediately, while the less-common path action stays on right
+        # click.  The same tag covers both the preview and the filename.
+        self.text.tag_bind(tag, "<Button-1>", lambda _e, t=tag: self._open_link(t))
+        self.text.tag_bind(tag, "<Button-3>", lambda e, t=tag: self._file_path_menu(e, self._link_targets[t]))
         self.text.tag_bind(tag, "<Enter>", lambda e: self.text.configure(cursor="hand2"))
         self.text.tag_bind(tag, "<Leave>", lambda e: self.text.configure(cursor="xterm"))
 
@@ -3434,9 +3751,12 @@ class ConversationView(ttk.Frame):
             self.text.tag_add(tag, start, f"{start}+1c")
             self.text.tag_add(body_tag, start, f"{start}+1c")
             self.text.insert("end", "\n", body_tag)
-
-        self.text.insert("end", os.path.basename(path), (body_tag, tag))
-        self.text.insert("end", "\n", body_tag)
+        else:
+            # A non-previewable attachment still needs a visible, clickable
+            # name.  Previewable images are their own affordance, so repeating
+            # a long generated filename below them only adds visual noise.
+            self.text.insert("end", os.path.basename(path), (body_tag, tag))
+            self.text.insert("end", "\n", body_tag)
 
     def _open_link(self, tag: str) -> None:
         path = self._link_targets.get(tag)
@@ -3489,10 +3809,54 @@ class ConversationView(ttk.Frame):
             menu.grab_release()
         return "break"
 
+    def _file_path_menu(self, event, path: str):
+        """Attachment actions that do not interrupt the normal open gesture."""
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="另存新檔…", command=lambda: self._save_path_as(path))
+        menu.add_command(label="複製完整路徑", command=lambda: self._copy_file_path(path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _copy_selected_or_block(self, widget: tk.Text | None, content: str) -> None:
+        if widget is not None:
+            try:
+                selected = widget.get("sel.first", "sel.last")
+            except tk.TclError:
+                selected = ""
+            if selected:
+                self._copy_block(selected)
+                return
+        self._copy_block(content)
+        return "break"
+
     def _copy_file_path(self, path: str) -> None:
         self.clipboard_clear()
         self.clipboard_append(path)
         self.app.set_status("已複製完整檔案路徑")
+
+    def _save_path_as(self, path: str) -> None:
+        """Copy any local attachment to a user-selected destination."""
+        if not os.path.isfile(path):
+            self.app.set_status(f"檔案已不存在：{path}")
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self,
+            title="另存附件",
+            initialfile=os.path.basename(path),
+            filetypes=(("所有檔案", "*.*"),),
+        )
+        if not destination:
+            return
+        if os.path.normcase(os.path.abspath(destination)) == os.path.normcase(os.path.abspath(path)):
+            self.app.set_status("另存位置與原始檔案相同")
+            return
+        try:
+            shutil.copy2(path, destination)
+            self.app.set_status(f"已另存為 {os.path.basename(destination)}")
+        except OSError as exc:
+            self.app.set_status(f"另存失敗：{exc}")
 
     def _open_path(self, path: str) -> None:
         if not os.path.isfile(path):
@@ -3561,6 +3925,19 @@ class ConversationView(ttk.Frame):
 
     # ------------------------------------------------------------ actions
 
+    @staticmethod
+    def _pass_through_ime_shortcut(_event):
+        """Keep Windows' Ctrl+Shift input-method shortcut outside the app."""
+        return None
+
+    def _on_input_return(self, event):
+        """Send plain Enter only; modified Enter stays with Tk/the IME."""
+        # Tk's generic <Return> pattern also matches modified Return.  Let
+        # Shift+Enter insert a newline and never consume Ctrl+Shift sequences.
+        if event.state & 0x0001:  # ShiftMask
+            return None
+        return self._on_send_key(event)
+
     def _on_send_key(self, _event):
         self.on_send()
         return "break"
@@ -3628,13 +4005,23 @@ class ProjectView(ttk.Frame):
         self.cwd_hint = ttk.Label(form, text="", style="Muted.TLabel")
         self.cwd_hint.grid(row=1, column=1, sticky="w", padx=(10, 0))
 
-        ttk.Label(form, text="模型", style="TLabel").grid(row=2, column=0, sticky="w", pady=4)
-        self.model_var = tk.StringVar()
-        ttk.Entry(form, textvariable=self.model_var).grid(row=2, column=1, sticky="ew", padx=(10, 0))
-        self.model_hint = ttk.Label(form, text="", style="Muted.TLabel")
-        self.model_hint.grid(row=3, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(form, text="預設 Agent", style="TLabel").grid(row=2, column=0, sticky="w", pady=4)
+        self.default_agent_var = tk.StringVar()
+        ttk.Combobox(
+            form, textvariable=self.default_agent_var,
+            values=(INHERIT_AGENT,) + tuple(AGENT_LABELS.values()),
+            state="readonly", width=46,
+        ).grid(row=2, column=1, sticky="w", padx=(10, 0))
+        self.default_agent_hint = ttk.Label(form, text="", style="Muted.TLabel")
+        self.default_agent_hint.grid(row=3, column=1, sticky="w", padx=(10, 0))
 
-        ttk.Label(form, text="沙箱模式", style="TLabel").grid(row=4, column=0, sticky="w", pady=4)
+        ttk.Label(form, text="模型", style="TLabel").grid(row=4, column=0, sticky="w", pady=4)
+        self.model_var = tk.StringVar()
+        ttk.Entry(form, textvariable=self.model_var).grid(row=4, column=1, sticky="ew", padx=(10, 0))
+        self.model_hint = ttk.Label(form, text="", style="Muted.TLabel")
+        self.model_hint.grid(row=5, column=1, sticky="w", padx=(10, 0))
+
+        ttk.Label(form, text="沙箱模式", style="TLabel").grid(row=6, column=0, sticky="w", pady=4)
         self.sandbox_var = tk.StringVar()
         ttk.Combobox(
             form,
@@ -3643,11 +4030,11 @@ class ProjectView(ttk.Frame):
             + tuple(codex_runner.sandbox_label(m) for m in codex_runner.SANDBOX_MODES),
             state="readonly",
             width=46,
-        ).grid(row=4, column=1, sticky="w", padx=(10, 0))
+        ).grid(row=6, column=1, sticky="w", padx=(10, 0))
         self.sandbox_hint = ttk.Label(form, text="", style="Muted.TLabel")
-        self.sandbox_hint.grid(row=5, column=1, sticky="w", padx=(10, 0))
+        self.sandbox_hint.grid(row=7, column=1, sticky="w", padx=(10, 0))
 
-        ttk.Label(form, text="Claude 權限", style="TLabel").grid(row=6, column=0, sticky="w", pady=4)
+        ttk.Label(form, text="Claude 權限", style="TLabel").grid(row=8, column=0, sticky="w", pady=4)
         self.claude_permission_var = tk.StringVar()
         ttk.Combobox(
             form,
@@ -3655,13 +4042,13 @@ class ProjectView(ttk.Frame):
             values=(INHERIT,) + tuple(codex_runner.CLAUDE_PERMISSION_LABELS.values()),
             state="readonly",
             width=46,
-        ).grid(row=6, column=1, sticky="w", padx=(10, 0))
+        ).grid(row=8, column=1, sticky="w", padx=(10, 0))
         self.claude_permission_hint = ttk.Label(form, text="", style="Muted.TLabel")
-        self.claude_permission_hint.grid(row=7, column=1, sticky="w", padx=(10, 0))
+        self.claude_permission_hint.grid(row=9, column=1, sticky="w", padx=(10, 0))
 
-        ttk.Label(form, text="提示詞", style="TLabel").grid(row=8, column=0, sticky="nw", pady=4)
+        ttk.Label(form, text="提示詞", style="TLabel").grid(row=10, column=0, sticky="nw", pady=4)
         prompt_wrap = tk.Frame(form, bg=COLORS["border"])
-        prompt_wrap.grid(row=8, column=1, sticky="ew", padx=(10, 0))
+        prompt_wrap.grid(row=10, column=1, sticky="ew", padx=(10, 0))
         self.prompt_text = tk.Text(
             prompt_wrap, height=5, wrap="word", bd=0, padx=8, pady=6,
             bg=COLORS["panel"], fg=COLORS["text"], font=(app.ui_font, 9), undo=True,
@@ -3669,7 +4056,7 @@ class ProjectView(ttk.Frame):
         self.prompt_text.pack(fill="both", expand=True, padx=1, pady=1)
         self.prompt_hint = ttk.Label(form, text="", style="Muted.TLabel",
                                      wraplength=620, justify="left")
-        self.prompt_hint.grid(row=9, column=1, sticky="w", padx=(10, 0), pady=(2, 0))
+        self.prompt_hint.grid(row=11, column=1, sticky="w", padx=(10, 0), pady=(2, 0))
 
         actions = ttk.Frame(self, style="TFrame")
         actions.grid(row=3, column=0, sticky="w", pady=(18, 0))
@@ -3680,6 +4067,8 @@ class ProjectView(ttk.Frame):
                    command=lambda: self.app.new_project(top_level=False)).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="開啟工作目錄", style="Toolbar.TButton",
                    command=self.open_cwd).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="變更檢視", style="Toolbar.TButton",
+                   command=self.app.review_worktree_changes).pack(side="left", padx=(8, 0))
 
         ttk.Label(
             self,
@@ -3711,11 +4100,16 @@ class ProjectView(ttk.Frame):
         self.summary_label.configure(text=summary)
 
         self.cwd_var.set(project.get("cwd") or "")
+        configured_agent = project.get("default_agent")
+        self.default_agent_var.set(AGENT_LABELS.get(configured_agent, INHERIT_AGENT))
         self.model_var.set(project.get("model") or "")
         self.sandbox_var.set(
             codex_runner.sandbox_label(project["sandbox"]) if project.get("sandbox") else INHERIT
         )
         self.cwd_hint.configure(text=f"繼承值：{ws.inherited(project['id'], 'cwd')}")
+        parent = ws.parent_of(project["id"])
+        inherited_agent = ws.project_agent(parent["id"]) if parent else ws.defaults.get("agent_id", store.DEFAULT_AGENT)
+        self.default_agent_hint.configure(text=f"繼承值：{AGENT_LABELS.get(inherited_agent, AGENT_LABELS[store.DEFAULT_AGENT])}")
         self.model_hint.configure(
             text=f"繼承值：{ws.inherited(project['id'], 'model') or '(config 預設)'}"
         )
@@ -3777,6 +4171,11 @@ class ProjectView(ttk.Frame):
         claude_permission = self.claude_permission_var.get()
         ws = self.app.ws
         ws.set_option(self.project_id, "cwd", cwd)
+        selected_agent = next(
+            (key for key, label in AGENT_LABELS.items() if label == self.default_agent_var.get()),
+            None,
+        )
+        ws.set_option(self.project_id, "default_agent", selected_agent)
         ws.set_option(self.project_id, "model", self.model_var.get().strip())
         ws.set_option(self.project_id, "prompt", self.prompt_text.get("1.0", "end").strip())
         ws.set_option(
@@ -3867,7 +4266,7 @@ class AgentsDialog(tk.Toplevel):
 
 
 class DefaultsDialog(tk.Toplevel):
-    """Workspace-wide fallbacks, used when no project overrides them."""
+    """Workspace-wide local fallbacks, used when no project overrides them."""
 
     def __init__(self, master: tk.Misc, app: TreeAgentApp) -> None:
         super().__init__(master)
@@ -3910,8 +4309,17 @@ class DefaultsDialog(tk.Toplevel):
             width=46,
         ).grid(row=2, column=1, columnspan=2, sticky="w", padx=(10, 0))
 
+        ttk.Label(frame, text="預設 Agent", style="TLabel").grid(row=3, column=0, sticky="w", pady=4)
+        self.agent_var = tk.StringVar(
+            value=AGENT_LABELS.get(defaults.get("agent_id"), AGENT_LABELS[store.DEFAULT_AGENT])
+        )
+        ttk.Combobox(
+            frame, textvariable=self.agent_var, values=tuple(AGENT_LABELS.values()),
+            state="readonly", width=46,
+        ).grid(row=3, column=1, columnspan=2, sticky="w", padx=(10, 0))
+
         buttons = ttk.Frame(frame, style="TFrame")
-        buttons.grid(row=3, column=0, columnspan=3, sticky="e", pady=(16, 0))
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e", pady=(16, 0))
         ttk.Button(buttons, text="取消", command=self.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(buttons, text="儲存", command=self._save).pack(side="right")
 
@@ -3928,14 +4336,21 @@ class DefaultsDialog(tk.Toplevel):
         if not os.path.isdir(cwd):
             messagebox.showwarning(APP_NAME, f"目錄不存在：\n{cwd}", parent=self)
             return
-        self.app.ws.defaults.update(
-            {
-                "cwd": cwd,
-                "model": self.model_var.get().strip() or None,
-                "sandbox": codex_runner.sandbox_from_label(self.sandbox_var.get()),
-            }
-        )
-        self.app.ws.save()
+        defaults = {
+            "cwd": cwd,
+            "model": self.model_var.get().strip() or None,
+            "sandbox": codex_runner.sandbox_from_label(self.sandbox_var.get()),
+            "agent_id": next(
+                (key for key, label in AGENT_LABELS.items() if label == self.agent_var.get()),
+                store.DEFAULT_AGENT,
+            ),
+        }
+        if isinstance(self.app.ws, RemoteWorkspace):
+            self.app.ws.set_workspace_default("cwd", defaults["cwd"])
+            self.app.ws.set_workspace_default("workspace_agent", defaults["agent_id"])
+        else:
+            self.app.ws.defaults.update(defaults)
+            self.app.ws.save()
         self.app.on_tree_select()
         self.app.set_status("已儲存預設值")
         self.destroy()

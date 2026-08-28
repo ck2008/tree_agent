@@ -37,7 +37,8 @@ assert not app.conv_view._tool_blocks
 rail = "\n".join(widget_text(app.conv_view.info_body))
 assert "工具紀錄（1）" in rail, rail
 logs = [child for child in app.conv_view.info_body.winfo_children() if isinstance(child, tk.Frame)]
-assert logs and tool in logs[-1].winfo_children()[0].get("1.0", "end")
+detail = logs[-1].winfo_children()[0].get("1.0", "end") if logs else ""
+assert logs and tool.splitlines()[0] in detail and "first output" not in detail
 print("tools are hidden from the transcript and retained in the information rail OK")
 
 app.on_close()
